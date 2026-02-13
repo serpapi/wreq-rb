@@ -11,8 +11,8 @@ RbSys::ExtensionTask.new("wreq_rb", GEMSPEC) do |ext|
   ext.lib_dir = "lib/wreq_rb"
   ext.cross_compile = true
   ext.cross_platform = %w[
-    aarch64-linux-musl
-    x86_64-linux-musl
+    aarch64-linux
+    x86_64-linux
     arm64-darwin
     x86_64-darwin
     x64-mingw-ucrt

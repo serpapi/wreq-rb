@@ -16,8 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - aarch64-linux-musl
-          - x86_64-linux-musl
+          - aarch64-linux
+          - x86_64-linux
           - arm64-darwin
           - x86_64-darwin
           - x64-mingw-ucrt
