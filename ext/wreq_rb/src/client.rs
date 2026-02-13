@@ -56,16 +56,13 @@ where
     where
         F: FnOnce(CancellationToken) -> R,
     {
-        let ptr = data as *mut CallData<F, R>;
-        let func = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).func) };
-        let token = unsafe { &*std::ptr::addr_of!((*ptr).token) };
-        let result = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).result) };
-        let panicked = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).panicked) };
-        let f = func.take().unwrap();
+        let d = data as *mut CallData<F, R>;
+        let f = (*d).func.take().unwrap();
+        let token = (*d).token.clone();
         // catch_unwind prevents a panic from unwinding through C frames (UB).
-        match panic::catch_unwind(AssertUnwindSafe(|| f(token.clone()))) {
-            Ok(val) => *result = Some(val),
-            Err(_) => *panicked = true,
+        match panic::catch_unwind(AssertUnwindSafe(|| f(token))) {
+            Ok(val) => ptr::write(&mut (*d).result, Some(val)),
+            Err(_) => (*d).panicked = true,
         }
         ptr::null_mut()
     }
@@ -73,9 +70,8 @@ where
     /// Unblock function called by Ruby when it wants to interrupt this thread.
     /// Cancels the token so the in-flight async work can abort promptly.
     unsafe extern "C" fn ubf<F, R>(data: *mut c_void) {
-        let ptr = data as *const CallData<F, R>;
-        let token = unsafe { &*std::ptr::addr_of!((*ptr).token) };
-        token.cancel();
+        let d = data as *const CallData<F, R>;
+        (*d).token.cancel();
     }
 
     let mut data = CallData {
