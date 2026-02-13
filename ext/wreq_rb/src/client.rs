@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::time::Duration;
 
@@ -48,32 +49,42 @@ where
         func: Option<F>,
         result: Option<R>,
         token: CancellationToken,
+        panicked: bool,
     }
 
     unsafe extern "C" fn call<F, R>(data: *mut c_void) -> *mut c_void
     where
         F: FnOnce(CancellationToken) -> R,
     {
-        let data = unsafe { &mut *(data as *mut CallData<F, R>) };
-        let f = data.func.take().unwrap();
-        data.result = Some(f(data.token.clone()));
+        let ptr = data as *mut CallData<F, R>;
+        let func = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).func) };
+        let token = unsafe { &*std::ptr::addr_of!((*ptr).token) };
+        let result = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).result) };
+        let panicked = unsafe { &mut *std::ptr::addr_of_mut!((*ptr).panicked) };
+        let f = func.take().unwrap();
+        // catch_unwind prevents a panic from unwinding through C frames (UB).
+        match panic::catch_unwind(AssertUnwindSafe(|| f(token.clone()))) {
+            Ok(val) => *result = Some(val),
+            Err(_) => *panicked = true,
+        }
         ptr::null_mut()
     }
 
     /// Unblock function called by Ruby when it wants to interrupt this thread.
     /// Cancels the token so the in-flight async work can abort promptly.
     unsafe extern "C" fn ubf<F, R>(data: *mut c_void) {
-        let data = unsafe { &*(data as *const CallData<F, R>) };
-        data.token.cancel();
+        let ptr = data as *const CallData<F, R>;
+        let token = unsafe { &*std::ptr::addr_of!((*ptr).token) };
+        token.cancel();
     }
 
-    let data_ptr: *mut c_void;
     let mut data = CallData {
         func: Some(f),
         result: None,
         token: CancellationToken::new(),
+        panicked: false,
     };
-    data_ptr = &mut data as *mut CallData<F, R> as *mut c_void;
+    let data_ptr = &mut data as *mut CallData<F, R> as *mut c_void;
 
     unsafe {
         rb_sys::rb_thread_call_without_gvl(
@@ -82,6 +93,10 @@ where
             Some(ubf::<F, R>),
             data_ptr,
         );
+    }
+
+    if data.panicked {
+        panic!("closure panicked inside without_gvl");
     }
 
     data.result.unwrap()
