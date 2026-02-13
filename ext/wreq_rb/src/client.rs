@@ -7,6 +7,7 @@ use magnus::{
     try_convert::TryConvert, Value,
 };
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue};
 use wreq_util::Emulation as BrowserEmulation;
 
@@ -33,40 +34,53 @@ fn runtime() -> &'static Runtime {
 // --------------------------------------------------------------------------
 
 /// Run a closure without the Ruby GVL, allowing other Ruby threads to execute.
+/// The closure receives a `CancellationToken` that is cancelled if Ruby
+/// interrupts the thread (e.g. `Thread.kill`, signal, timeout).
 ///
 /// # Safety
 /// The closure must NOT access any Ruby objects or call any Ruby C API.
 /// Extract all data from Ruby before calling this, convert results after.
 unsafe fn without_gvl<F, R>(f: F) -> R
 where
-    F: FnOnce() -> R,
+    F: FnOnce(CancellationToken) -> R,
 {
     struct CallData<F, R> {
         func: Option<F>,
         result: Option<R>,
+        token: CancellationToken,
     }
 
     unsafe extern "C" fn call<F, R>(data: *mut c_void) -> *mut c_void
     where
-        F: FnOnce() -> R,
+        F: FnOnce(CancellationToken) -> R,
     {
         let data = unsafe { &mut *(data as *mut CallData<F, R>) };
         let f = data.func.take().unwrap();
-        data.result = Some(f());
+        data.result = Some(f(data.token.clone()));
         ptr::null_mut()
     }
 
+    /// Unblock function called by Ruby when it wants to interrupt this thread.
+    /// Cancels the token so the in-flight async work can abort promptly.
+    unsafe extern "C" fn ubf<F, R>(data: *mut c_void) {
+        let data = unsafe { &*(data as *const CallData<F, R>) };
+        data.token.cancel();
+    }
+
+    let data_ptr: *mut c_void;
     let mut data = CallData {
         func: Some(f),
         result: None,
+        token: CancellationToken::new(),
     };
+    data_ptr = &mut data as *mut CallData<F, R> as *mut c_void;
 
     unsafe {
         rb_sys::rb_thread_call_without_gvl(
             Some(call::<F, R>),
-            &mut data as *mut CallData<F, R> as *mut c_void,
-            None,
-            ptr::null_mut(),
+            data_ptr,
+            Some(ubf::<F, R>),
+            data_ptr,
         );
     }
 
@@ -81,6 +95,13 @@ struct ResponseData {
     url: String,
     version: String,
     content_length: Option<u64>,
+}
+
+/// Outcome of the network call performed outside the GVL.
+enum RequestOutcome {
+    Ok(ResponseData),
+    Err(wreq::Error),
+    Interrupted,
 }
 
 // --------------------------------------------------------------------------
@@ -270,26 +291,47 @@ impl Client {
 
         // Release the GVL so other Ruby threads can run during I/O.
         // All Ruby data has been extracted into Rust types above.
-        let result: Result<ResponseData, wreq::Error> = unsafe {
-            without_gvl(|| {
-                let resp = runtime().block_on(req.send())?;
-                let status = resp.status().as_u16();
-                let url = resp.uri().to_string();
-                let version = format!("{:?}", resp.version());
-                let content_length = resp.content_length();
-                let headers: Vec<(String, String)> = resp
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| {
-                        (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())
-                    })
-                    .collect();
-                let body = runtime().block_on(resp.bytes())?.to_vec();
-                Ok(ResponseData { status, headers, body, url, version, content_length })
+        // The closure receives a CancellationToken that is triggered if Ruby
+        // wants to interrupt this thread (Thread.kill, signal, etc.).
+        let outcome: RequestOutcome = unsafe {
+            without_gvl(|cancel| {
+                runtime().block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => RequestOutcome::Interrupted,
+                        res = async {
+                            let resp = match req.send().await {
+                                Ok(r) => r,
+                                Err(e) => return RequestOutcome::Err(e),
+                            };
+                            let status = resp.status().as_u16();
+                            let url = resp.uri().to_string();
+                            let version = format!("{:?}", resp.version());
+                            let content_length = resp.content_length();
+                            let headers: Vec<(String, String)> = resp
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())
+                                })
+                                .collect();
+                            match resp.bytes().await {
+                                Ok(b) => RequestOutcome::Ok(ResponseData {
+                                    status, headers, body: b.to_vec(), url, version, content_length,
+                                }),
+                                Err(e) => RequestOutcome::Err(e),
+                            }
+                        } => res,
+                    }
+                })
             })
         };
 
-        let data = result.map_err(to_magnus_error)?;
+        let data = match outcome {
+            RequestOutcome::Ok(d) => d,
+            RequestOutcome::Err(e) => return Err(to_magnus_error(e)),
+            RequestOutcome::Interrupted => return Err(generic_error("request interrupted")),
+        };
         Ok(Response::new(data.status, data.headers, data.body, data.url, data.version, data.content_length))
     }
 }

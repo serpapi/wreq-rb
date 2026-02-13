@@ -26,6 +26,7 @@ wreq = { path = "../../vendor/wreq", features = [
 ] }
 wreq-util = { version = "=3.0.0-rc.9", features = ["emulation", "emulation-serde"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 serde_json = "1.0"
 bytes = "1"
 http = "1"

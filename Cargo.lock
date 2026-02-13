@@ -2545,6 +2545,7 @@ dependencies = [
  "rb-sys",
  "serde_json",
  "tokio",
+ "tokio-util",
  "wreq",
  "wreq-util",
 ]
