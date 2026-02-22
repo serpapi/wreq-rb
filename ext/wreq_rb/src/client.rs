@@ -318,9 +318,6 @@ impl Client {
         }
 
         // Release the GVL so other Ruby threads can run during I/O.
-        // All Ruby data has been extracted into Rust types above.
-        // The closure receives a CancellationToken that is triggered if Ruby
-        // wants to interrupt this thread (Thread.kill, signal, etc.).
         let outcome: RequestOutcome = unsafe {
             without_gvl(|cancel| {
                 runtime().block_on(async {
