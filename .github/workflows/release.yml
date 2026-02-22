@@ -18,8 +18,8 @@ jobs:
         platform:
           - aarch64-linux
           - x86_64-linux
-          # - arm64-darwin
-          # - x86_64-darwin
+          - arm64-darwin
+          - x86_64-darwin
           # - x64-mingw-ucrt
     steps:
       - uses: actions/checkout@v6
@@ -36,7 +36,7 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: "2.7,3.3,3.4"
-          cache-version: v1
+          cache-version: v2
 
       - uses: actions/upload-artifact@v6
         with:

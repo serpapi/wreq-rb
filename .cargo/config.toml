@@ -1,0 +1,7 @@
+# Tell boring-sys2's build script to use the cmake toolchain file when building
+# BoringSSL for darwin.
+# Cargo reads this from the mounted workspace inside the Docker container, so
+# the env var is available without any special Docker forwarding.
+[env]
+CMAKE_TOOLCHAIN_FILE_aarch64_apple_darwin = { value = "cmake/aarch64-apple-darwin.cmake", relative = true }
+CMAKE_TOOLCHAIN_FILE_x86_64_apple_darwin = { value = "cmake/x86_64-apple-darwin.cmake", relative = true }
