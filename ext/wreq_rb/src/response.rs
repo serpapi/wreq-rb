@@ -86,9 +86,8 @@ impl Response {
     fn json(&self) -> Result<Value, magnus::Error> {
         let ruby = unsafe { Ruby::get_unchecked() };
         let text = self.text()?;
-        let val: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| generic_error(e))?;
-        json_to_ruby(&ruby, &val)
+        let json_module: Value = ruby.class_object().const_get("JSON")?;
+        json_module.funcall("parse", (text,))
     }
 
     fn inspect(&self) -> String {
@@ -100,43 +99,6 @@ impl Response {
 
     fn to_s(&self) -> Result<String, magnus::Error> {
         self.text()
-    }
-}
-
-pub fn json_to_ruby(ruby: &Ruby, val: &serde_json::Value) -> Result<Value, magnus::Error> {
-    match val {
-        serde_json::Value::Null => Ok(ruby.qnil().as_value()),
-        serde_json::Value::Bool(b) => {
-            if *b {
-                Ok(ruby.qtrue().as_value())
-            } else {
-                Ok(ruby.qfalse().as_value())
-            }
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(ruby.integer_from_i64(i).as_value())
-            } else if let Some(f) = n.as_f64() {
-                Ok(ruby.float_from_f64(f).as_value())
-            } else {
-                Ok(ruby.qnil().as_value())
-            }
-        }
-        serde_json::Value::String(s) => Ok(ruby.str_new(s).as_value()),
-        serde_json::Value::Array(arr) => {
-            let ary = ruby.ary_new_capa(arr.len());
-            for item in arr {
-                ary.push(json_to_ruby(ruby, item)?)?;
-            }
-            Ok(ary.as_value())
-        }
-        serde_json::Value::Object(map) => {
-            let hash = ruby.hash_new();
-            for (k, v) in map {
-                hash.aset(ruby.str_new(k), json_to_ruby(ruby, v)?)?;
-            }
-            Ok(hash.as_value())
-        }
     }
 }
 

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 begin
   # pre-compiled extension by rake-compiler is located inside lib/wreq_rb/<ruby_version>/
   RUBY_VERSION =~ /(\d+\.\d+)/

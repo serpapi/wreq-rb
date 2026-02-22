@@ -359,7 +359,9 @@ fn apply_request_options(
     }
 
     if let Some(json_val) = hash_get_value(opts, "json")? {
-        let json_str = ruby_to_json_string(json_val)?;
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let json_module: Value = ruby.class_object().const_get("JSON")?;
+        let json_str: String = json_module.funcall("generate", (json_val,))?;
         req = req
             .header("content-type", "application/json")
             .body(json_str);
@@ -526,69 +528,6 @@ fn hash_to_pairs(hash: &RHash) -> Result<Vec<(String, String)>, magnus::Error> {
         Ok(magnus::r_hash::ForEach::Continue)
     })?;
     Ok(pairs)
-}
-
-// --------------------------------------------------------------------------
-// Ruby to JSON conversion
-// --------------------------------------------------------------------------
-
-fn ruby_to_json_string(val: Value) -> Result<String, magnus::Error> {
-    let json_val = ruby_to_json(val)?;
-    serde_json::to_string(&json_val).map_err(|e| generic_error(e))
-}
-
-fn ruby_to_json(val: Value) -> Result<serde_json::Value, magnus::Error> {
-    let ruby = unsafe { Ruby::get_unchecked() };
-    if val.is_nil() {
-        return Ok(serde_json::Value::Null);
-    }
-    if val.is_kind_of(ruby.class_true_class()) {
-        return Ok(serde_json::Value::Bool(true));
-    }
-    if val.is_kind_of(ruby.class_false_class()) {
-        return Ok(serde_json::Value::Bool(false));
-    }
-    if val.is_kind_of(ruby.class_integer()) {
-        let i: i64 = TryConvert::try_convert(val)?;
-        return Ok(serde_json::Value::Number(i.into()));
-    }
-    if val.is_kind_of(ruby.class_float()) {
-        let f: f64 = TryConvert::try_convert(val)?;
-        return Ok(serde_json::Value::Number(
-            serde_json::Number::from_f64(f).unwrap_or_else(|| 0.into()),
-        ));
-    }
-    if val.is_kind_of(ruby.class_string()) {
-        let s: String = TryConvert::try_convert(val)?;
-        return Ok(serde_json::Value::String(s));
-    }
-    if val.is_kind_of(ruby.class_array()) {
-        let ary = RArray::try_convert(val)?;
-        let mut vec = Vec::with_capacity(ary.len());
-        for i in 0..ary.len() {
-            let item: Value = ary.entry(i as isize)?;
-            vec.push(ruby_to_json(item)?);
-        }
-        return Ok(serde_json::Value::Array(vec));
-    }
-    if val.is_kind_of(ruby.class_hash()) {
-        let hash = RHash::try_convert(val)?;
-        let mut map = serde_json::Map::new();
-        hash.foreach(|k: Value, v: Value| {
-            let ruby = unsafe { Ruby::get_unchecked() };
-            let key: String = if k.is_kind_of(ruby.class_symbol()) {
-                k.funcall("to_s", ())?
-            } else {
-                TryConvert::try_convert(k)?
-            };
-            map.insert(key, ruby_to_json(v)?);
-            Ok(magnus::r_hash::ForEach::Continue)
-        })?;
-        return Ok(serde_json::Value::Object(map));
-    }
-    // fallback: .to_s
-    let s: String = val.funcall("to_s", ())?;
-    Ok(serde_json::Value::String(s))
 }
 
 // --------------------------------------------------------------------------
