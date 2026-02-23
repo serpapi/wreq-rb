@@ -215,7 +215,7 @@ impl Client {
                 }
             }
 
-            if let Some(enabled) = hash_get_bool(&opts, "cookies")? {
+            if let Some(enabled) = hash_get_bool(&opts, "cookie_store")? {
                 builder = builder.cookie_store(enabled);
             }
 

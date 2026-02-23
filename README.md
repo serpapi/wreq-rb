@@ -61,7 +61,7 @@ client = Wreq::Client.new(
   connect_timeout: 5,          # connection timeout
   read_timeout: 15,            # read timeout
   redirect: 10,                # follow up to 10 redirects (false to disable)
-  cookies: true,               # enable cookie jar
+  cookie_store: true,          # enable cookie jar
   proxy: "http://proxy:8080",  # proxy URL (supports http, https, socks5)
   proxy_user: "user",          # proxy auth
   proxy_pass: "pass",
