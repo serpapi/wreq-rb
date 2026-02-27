@@ -98,7 +98,7 @@ jobs:
         run: gem install gems/*.gem --verbose
 
       - name: Run tests
-        run: bundle exec rake test
+        run: ruby -Itest -e 'Dir.glob("test/**/*_test.rb").each { |f| require File.expand_path(f) }'
 
   test-cross-gem:
     name: Test cross gem / Ruby ${{ matrix.ruby }}
@@ -127,7 +127,7 @@ jobs:
         run: gem install gems/*.gem
 
       - name: Run tests
-        run: bundle exec rake test
+        run: ruby -Itest -e 'Dir.glob("test/**/*_test.rb").each { |f| require File.expand_path(f) }'
 
   publish:
     name: Publish gems
