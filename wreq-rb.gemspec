@@ -20,6 +20,7 @@ Gem::Specification.new do |spec|
     "vendor/wreq/**/*.{rs,toml}",
     "vendor/wreq/LICENSE",
     "vendor/wreq/README.md",
+    "patches/*.patch",
     "Cargo.toml",
     "Cargo.lock",
     "LICENSE",
