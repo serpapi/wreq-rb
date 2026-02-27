@@ -146,7 +146,7 @@ const DEFAULT_EMULATION: BrowserEmulation = BrowserEmulation::Chrome143;
 fn parse_emulation(name: &str) -> Result<BrowserEmulation, magnus::Error> {
     let json_val = serde_json::Value::String(name.to_string());
     serde_json::from_value::<BrowserEmulation>(json_val)
-        .map_err(|_| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_143', 'firefox_146', 'safari_18_5', etc.", name)))
+        .map_err(|_| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_143', 'firefox_146', 'safari_18.5', etc.", name)))
 }
 
 // --------------------------------------------------------------------------

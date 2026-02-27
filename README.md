@@ -146,7 +146,7 @@ resp = client.get("https://example.com", emulation: "safari_26_2")
 |---------|---------------|
 | Chrome | `chrome_100` .. `chrome_143` |
 | Firefox | `firefox_109`, `firefox_146`, `firefox_private_135` |
-| Safari | `safari_15_3` .. `safari_26_2`, `safari_ios_26`, `safari_ipad_18` |
+| Safari | `safari_15.3` .. `safari_26.2`, `safari_ios_26`, `safari_ipad_18` |
 | Edge | `edge_101` .. `edge_142` |
 | Opera | `opera_116` .. `opera_119` |
 | OkHttp | `okhttp_3_9` .. `okhttp_5` |
