@@ -38,4 +38,29 @@ class ResponseTest < Minitest::Test
     assert_equal body_size, transfer,
       "transfer_size (#{transfer}) should equal body size (#{body_size}) for uncompressed response"
   end
+
+  def test_headers_values_are_arrays
+    resp = Wreq.get("https://httpbin.org/get")
+    assert_equal 200, resp.status
+    headers = resp.headers
+    assert_kind_of Hash, headers
+    headers.each do |key, value|
+      assert_kind_of String, key, "header key should be a String"
+      assert_kind_of Array, value, "header value for '#{key}' should be an Array"
+      value.each do |v|
+        assert_kind_of String, v, "each element in '#{key}' array should be a String"
+      end
+    end
+    assert_equal 1, headers["content-type"].length
+  end
+
+  def test_headers_multiple_set_cookie
+    client = Wreq::Client.new(redirect: false)
+    resp = client.get("https://httpbin.org/cookies/set?a=1&b=2")
+    headers = resp.headers
+    cookies = headers["set-cookie"]
+    assert_kind_of Array, cookies, "set-cookie should be an Array"
+    assert cookies.length >= 2,
+      "expected at least 2 set-cookie values, got #{cookies.length}: #{cookies.inspect}"
+  end
 end

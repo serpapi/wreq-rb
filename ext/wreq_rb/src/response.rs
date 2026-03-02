@@ -1,5 +1,5 @@
 use magnus::{
-    method, prelude::*, Module, RHash, Ruby, Value,
+    method, prelude::*, Module, RArray, RHash, Ruby, Value,
 };
 
 use crate::error::generic_error;
@@ -53,7 +53,17 @@ impl Response {
         let ruby = unsafe { Ruby::get_unchecked() };
         let hash = ruby.hash_new();
         for (k, v) in &self.headers {
-            hash.aset(k.as_str(), v.as_str())?;
+            let key = k.as_str();
+            let existing: Value = hash.aref(key)?;
+            if existing.is_nil() {
+                let ary = ruby.ary_new();
+                ary.push(v.as_str())?;
+                hash.aset(key, ary)?;
+            } else {
+                let ary = RArray::from_value(existing)
+                    .ok_or_else(|| generic_error("expected array in headers hash"))?;
+                ary.push(v.as_str())?;
+            }
         }
         Ok(hash)
     }
