@@ -79,4 +79,14 @@ class RequestTest < Minitest::Test
       basic: ["user", "pass"])
     assert_equal 200, resp.status
   end
+
+  def test_headers_with_mixed_types
+    resp = Wreq.get("https://httpbin.org/headers",
+      headers: { :"X-Symbol" => 99, "X-Nil" => nil, "X-Str" => "ok" })
+    assert_equal 200, resp.status
+    body = resp.json
+    assert_equal "99", body["headers"]["X-Symbol"]
+    assert_nil body["headers"]["X-Nil"]
+    assert_equal "ok", body["headers"]["X-Str"]
+  end
 end

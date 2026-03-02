@@ -511,10 +511,20 @@ fn hash_get_hash(hash: &RHash, key: &str) -> Result<Option<RHash>, magnus::Error
 
 fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
     let mut hmap = HeaderMap::new();
-    hash.foreach(|k: String, v: String| {
+    hash.foreach(|k: Value, v: Value| {
+        if v.is_nil() {
+            return Ok(magnus::r_hash::ForEach::Continue);
+        }
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let ks: String = if k.is_kind_of(ruby.class_symbol()) {
+            k.funcall("to_s", ())?
+        } else {
+            TryConvert::try_convert(k)?
+        };
+        let vs: String = v.funcall("to_s", ())?;
         let name =
-            HeaderName::from_bytes(k.as_bytes()).map_err(|e| generic_error(e))?;
-        let value = HeaderValue::from_str(&v).map_err(|e| generic_error(e))?;
+            HeaderName::from_bytes(ks.as_bytes()).map_err(|e| generic_error(e))?;
+        let value = HeaderValue::from_str(&vs).map_err(|e| generic_error(e))?;
         hmap.insert(name, value);
         Ok(magnus::r_hash::ForEach::Continue)
     })?;
@@ -526,8 +536,7 @@ fn hash_to_pairs(hash: &RHash) -> Result<Vec<(String, String)>, magnus::Error> {
     hash.foreach(|k: Value, v: Value| {
         let ruby = unsafe { Ruby::get_unchecked() };
         let ks: String = if k.is_kind_of(ruby.class_symbol()) {
-            let s: String = k.funcall("to_s", ())?;
-            s
+            k.funcall("to_s", ())?
         } else {
             TryConvert::try_convert(k)?
         };

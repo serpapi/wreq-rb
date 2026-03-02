@@ -35,4 +35,16 @@ class ClientTest < Minitest::Test
     assert_equal "HTTP/2.0", resp.version,
       "Expected HTTP/2.0 when http2_only: true, got #{resp.version}"
   end
+
+  def test_default_headers_with_mixed_types
+    client = Wreq::Client.new(
+      headers: { :"X-Symbol" => 99, "X-Nil" => nil, "X-Str" => "ok" }
+    )
+    resp = client.get("https://httpbin.org/headers")
+    assert_equal 200, resp.status
+    body = resp.json
+    assert_equal "99", body["headers"]["X-Symbol"]
+    assert_nil body["headers"]["X-Nil"]
+    assert_equal "ok", body["headers"]["X-Str"]
+  end
 end
