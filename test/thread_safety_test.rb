@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "socket"
 
 class ThreadSafetyTest < Minitest::Test
   def test_gvl_released_during_network_io
@@ -90,5 +91,78 @@ class ThreadSafetyTest < Minitest::Test
     assert elapsed < 3,
       "Thread.kill took #{elapsed.round(2)}s to interrupt the request " \
       "(expected < 3s; cancellation may not be working)"
+  end
+
+  def test_thread_kill_aborts_inflight_connection
+    # Use a local TCP server to prove the HTTP connection is actually
+    # closed (not just that the Ruby thread exits). The server accepts
+    # the connection, reads the request, then tries to keep writing to
+    # the socket. Once the client aborts, the write will fail with a
+    # broken-pipe / connection-reset error.
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+
+    server_error = nil
+    client_disconnected = false
+    chunks_sent = 0
+
+    server_thread = Thread.new do
+      conn = server.accept
+      request = +""
+      loop do
+        request << conn.readpartial(4096)
+        break if request.include?("\r\n\r\n")
+      end
+
+      conn.write "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+      begin
+        50.times do
+          conn.write "5\r\nhello\r\n"
+          chunks_sent += 1
+          sleep 0.1
+        end
+        # If we get here, the client never disconnected
+        conn.write "0\r\n\r\n"
+      rescue Errno::EPIPE, Errno::ECONNRESET, Errno::EPROTOTYPE, IOError
+        client_disconnected = true
+      ensure
+        conn.close rescue nil
+      end
+    end
+
+    client = Wreq::Client.new(
+      timeout: 30,
+      emulation: false,
+      verify_cert: false,
+      verify_host: false,
+      http1_only: true
+    )
+
+    request_thread = Thread.new do
+      client.get("http://127.0.0.1:#{port}/slow")
+    rescue => e
+      # Expected — request interrupted
+      e
+    end
+
+    sleep 0.5
+
+    request_thread.kill
+    request_thread.join(5)
+
+    server_thread.join(5)
+
+    assert client_disconnected,
+      "Expected the server to detect a client disconnect (broken pipe) " \
+      "after Thread.kill, but the connection was not aborted"
+
+    assert chunks_sent >= 1,
+      "Expected at least 1 chunk to be sent before disconnect, got #{chunks_sent}"
+    assert chunks_sent < 10,
+      "Expected the connection to be aborted before 10 chunks were sent, " \
+      "but #{chunks_sent} chunks were sent"
+  ensure
+    server&.close rescue nil
   end
 end
