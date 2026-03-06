@@ -10,7 +10,7 @@ use magnus::{
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-use wreq::header::{HeaderMap, HeaderName, HeaderValue};
+use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq_util::{Emulation as BrowserEmulation, EmulationOS, EmulationOption};
 
 use crate::error::{generic_error, to_magnus_error};
@@ -192,6 +192,12 @@ impl Client {
         let mut builder = wreq::Client::builder();
 
         if let Some(opts) = opts {
+            // Apply header_order BEFORE emulation so the user's ordering takes precedence
+            if let Some(ary) = hash_get_array(&opts, "header_order")? {
+                let orig = array_to_orig_header_map(ary)?;
+                builder = builder.orig_headers(orig);
+            }
+
             if let Some(val) = hash_get_value(&opts, "emulation")? {
                 let ruby = unsafe { Ruby::get_unchecked() };
                 if val.is_kind_of(ruby.class_false_class()) {
@@ -534,6 +540,27 @@ fn hash_get_hash(hash: &RHash, key: &str) -> Result<Option<RHash>, magnus::Error
         Some(v) => Ok(Some(RHash::try_convert(v)?)),
         None => Ok(None),
     }
+}
+
+fn hash_get_array(hash: &RHash, key: &str) -> Result<Option<RArray>, magnus::Error> {
+    match hash_get_value(hash, key)? {
+        Some(v) => Ok(Some(RArray::try_convert(v)?)),
+        None => Ok(None),
+    }
+}
+
+fn array_to_orig_header_map(ary: RArray) -> Result<OrigHeaderMap, magnus::Error> {
+    let mut orig = OrigHeaderMap::with_capacity(ary.len());
+    for elem in ary.into_iter() {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let name_str: String = if elem.is_kind_of(ruby.class_symbol()) {
+            elem.funcall("to_s", ())?  
+        } else {
+            TryConvert::try_convert(elem)?
+        };
+        orig.insert(name_str);
+    }
+    Ok(orig)
 }
 
 fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {

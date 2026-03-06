@@ -77,6 +77,11 @@ client = Wreq::Client.new(
   zstd: true,                  # enable zstd decompression
   emulation: "chrome_143",     # browser emulation (enabled by default)
   emulation_os: "windows",     # OS emulation: windows, macos (default), linux, android, ios
+  header_order: [              # wire order of headers (names only, case-sensitive)
+    "host",                    # listed headers appear first in the given order, remaining
+    "user-agent",              # emulation headers follow.
+    "accept",
+  ],
   headers: {                   # default headers for all requests
     "Accept" => "application/json"
   }

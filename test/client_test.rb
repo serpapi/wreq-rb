@@ -47,4 +47,70 @@ class ClientTest < Minitest::Test
     assert_nil body["headers"]["X-Nil"]
     assert_equal "ok", body["headers"]["X-Str"]
   end
+
+  def test_header_order
+    order = ["x-zzz", "x-aaa", "x-ccc"]
+    client = Wreq::Client.new(
+      emulation: false,
+      http1_only: true,
+      no_proxy: true,
+      header_order: order,
+      headers: { "x-aaa" => "1", "x-ccc" => "2", "x-zzz" => "3" }
+    )
+    received = capture_wire_headers { |url| client.get(url) }
+
+    positions = order.map { |h| received.index(h) }.compact
+    assert_equal order.size, positions.size,
+      "Not all target headers found in: #{received.inspect}"
+    assert_equal positions.sort, positions,
+      "Expected #{order.inspect} in order, got positions #{positions.inspect} in: #{received.inspect}"
+  end
+
+  def test_header_order_takes_precedence_over_emulation
+    # Chrome emulation normally puts "user-agent" before "accept". We reverse
+    # that relationship to prove the user's header_order wins.
+    order = ["host", "accept", "user-agent"]
+    client = Wreq::Client.new(
+      emulation: "chrome_145",
+      http1_only: true,
+      no_proxy: true,
+      header_order: order
+    )
+    received = capture_wire_headers { |url| client.get(url) }
+
+    positions = order.map { |h| received.index(h) }.compact
+    assert_equal order.size, positions.size,
+      "Not all target headers found in: #{received.inspect}"
+    assert_equal positions.sort, positions,
+      "Expected user's header_order #{order.inspect} to take precedence; " \
+      "got positions #{positions.inspect} in: #{received.inspect}"
+  end
+
+  private
+
+  # Spins up a local TCP server, yields the port formatted into a URL, captures
+  # the header names from the raw HTTP/1.1 request, then tears down the server.
+  def capture_wire_headers
+    require "socket"
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    received = []
+    t = Thread.new do
+      conn = server.accept
+      conn.gets # skip request line
+      loop do
+        line = conn.gets&.chomp
+        break if line.nil? || line.empty?
+        received << line.split(":", 2).first.downcase
+      end
+      conn.write "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+      conn.close
+    rescue
+      conn&.close
+    end
+    yield format("http://127.0.0.1:#{port}/")
+    t.join(5)
+    server.close
+    received
+  end
 end
