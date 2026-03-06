@@ -1,0 +1,207 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require "json"
+require "wreq-rb"
+
+cfg = {
+  method:       nil,
+  headers:      {},
+  include:      false,
+  silent:       false,
+  redirect:     10,
+  verify_cert:  true,
+  verify_host:  true,
+  pretty:       false,
+}
+req = {}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: wreq [METHOD] URL [options]"
+
+  o.separator ""
+  o.separator "Request:"
+
+  o.on("-X", "--request METHOD", "HTTP method (default: GET)") { |m| cfg[:method] = m.upcase }
+
+  o.on("-H", "--header LINE", 'Request header, e.g. "Accept: application/json" (repeatable)') do |h|
+    name, _, value = h.partition(":")
+    cfg[:headers][name.strip] = value.strip
+  end
+
+  o.on("-d", "--data DATA",
+       "Request body. Prefix with @ to read from file, e.g. @body.json") do |d|
+    cfg[:method] ||= "POST"
+    if d.start_with?("@")
+      path = d[1..]
+      abort "wreq: cannot read '#{path}': file not found" unless File.exist?(path)
+      req[:body] = File.binread(path)
+    else
+      req[:body] = d
+    end
+  end
+
+  o.on("--json DATA",
+       "JSON body (sets Content-Type: application/json). Prefix with @ for file.") do |d|
+    cfg[:method] ||= "POST"
+    raw = d.start_with?("@") ? File.read(d[1..]) : d
+    begin
+      req[:json] = JSON.parse(raw)
+    rescue JSON::ParserError => e
+      abort "wreq: invalid JSON: #{e.message}"
+    end
+  end
+
+  o.on("--form PAIR", "Form field as key=value (repeatable)") do |f|
+    cfg[:method] ||= "POST"
+    key, _, val = f.partition("=")
+    (req[:form] ||= {})[key] = val
+  end
+
+  o.on("-q", "--query PAIR", "Query parameter as key=value (repeatable)") do |q|
+    key, _, val = q.partition("=")
+    (req[:query] ||= {})[key] = val
+  end
+
+  o.separator ""
+  o.separator "Auth:"
+
+  o.on("-u", "--user USER[:PASS]", "Basic auth credentials") do |u|
+    user, _, pass = u.partition(":")
+    req[:basic] = [user, pass]
+  end
+
+  o.on("--bearer TOKEN", "Bearer token auth") { |t| req[:bearer] = t }
+
+  o.separator ""
+  o.separator "Output:"
+
+  o.on("-i", "--include", "Include response headers in stdout before the body") do
+    cfg[:include] = true
+  end
+
+  o.on("-s", "--silent", "Suppress body output") { cfg[:silent] = true }
+
+  o.on("-o", "--output FILE", "Write body to FILE") { |f| cfg[:output] = f }
+
+  o.on("--pretty", "Pretty-print JSON response bodies") { cfg[:pretty] = true }
+
+  o.separator ""
+  o.separator "Connection:"
+
+  o.on("-L", "--location", "Follow redirects (default: on, max 10)") { cfg[:redirect] = 10 }
+  o.on("--no-location", "Do not follow redirects") { cfg[:redirect] = false }
+  o.on("--max-redirects N", Integer, "Max redirects (default: 10)") { |n| cfg[:redirect] = n }
+
+  o.on("-k", "--insecure", "Skip TLS certificate verification") do
+    cfg[:verify_cert] = false
+    cfg[:verify_host] = false
+  end
+
+  o.on("-x", "--proxy URL", "Proxy URL (e.g. http://host:port)") { |p| cfg[:proxy] = p }
+
+  o.on("--timeout SECS", Float, "Total timeout in seconds") { |t| cfg[:timeout] = t }
+  o.on("--connect-timeout SECS", Float, "Connection timeout in seconds") { |t| cfg[:connect_timeout] = t }
+
+  o.on("--http1", "Force HTTP/1.1") { cfg[:http1_only] = true }
+  o.on("--http2", "Force HTTP/2")   { cfg[:http2_only] = true }
+
+  o.separator ""
+  o.separator "Emulation:"
+
+  o.on("--emulation PROFILE",
+       "Browser emulation profile (e.g. chrome_145, firefox_147, safari_26.2)") do |e|
+    cfg[:emulation] = e
+  end
+
+  o.on("--emulation-os OS",
+       "Emulation OS override: windows, macos, linux, android, ios") do |os|
+    cfg[:emulation_os] = os
+  end
+
+  o.on("--no-emulation", "Disable browser emulation entirely") { cfg[:emulation] = false }
+
+  o.on("-A", "--user-agent UA", "Override User-Agent header") { |ua| cfg[:user_agent] = ua }
+
+  o.on("--cookie-store", "Enable persistent cookie jar for this request") { cfg[:cookie_store] = true }
+
+  o.separator ""
+
+  o.on("-V", "--version", "Print version and exit") { puts "wreq #{Wreq::VERSION}"; exit 0 }
+  o.on_tail("-h", "--help", "Show this help") { puts o; exit 0 }
+end
+
+args = ARGV.dup
+
+# Allow bare method as first positional arg: `wreq POST https://...`
+if args.first =~ /\A[A-Z]+\z/
+  cfg[:method] = args.shift
+end
+
+begin
+  parser.parse!(args)
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  abort "wreq: #{e.message}\nRun 'wreq --help' for usage."
+end
+
+url = args.shift
+unless url
+  $stderr.puts parser
+  exit 1
+end
+
+cfg[:method] ||= "GET"
+
+# Build Wreq::Client options (connection/emulation settings only)
+CLIENT_KEYS = %i[emulation emulation_os user_agent proxy timeout connect_timeout
+                 http1_only http2_only cookie_store https_only].freeze
+client_opts = cfg.slice(*CLIENT_KEYS).reject { |_, v| v.nil? }
+client_opts[:redirect]    = cfg[:redirect]
+client_opts[:verify_cert] = cfg[:verify_cert]
+client_opts[:verify_host] = cfg[:verify_host]
+
+client = Wreq::Client.new(**client_opts)
+
+# Per-request headers
+req[:headers] = cfg[:headers] unless cfg[:headers].empty?
+
+# Execute request
+begin
+  response = client.public_send(cfg[:method].downcase, url, **req)
+rescue NoMethodError
+  abort "wreq: unsupported HTTP method '#{cfg[:method]}'"
+rescue => e
+  abort "wreq: #{e.message}"
+end
+
+# -i: print response status + headers to stdout before body
+if cfg[:include]
+  puts "#{response.version} #{response.status}"
+  response.headers.each do |k, values|
+    Array(values).each { |v| puts "#{k}: #{v}" }
+  end
+  puts ""
+end
+
+# Output body
+unless cfg[:silent] || cfg[:method] == "HEAD"
+  if cfg[:output]
+    bytes = response.body_bytes.pack("C*")
+    File.binwrite(cfg[:output], bytes)
+    warn "Saved #{bytes.bytesize} bytes to #{cfg[:output]}"
+  else
+    body = response.body
+    if cfg[:pretty] && !body.nil? && !body.empty?
+      body = begin
+        JSON.pretty_generate(JSON.parse(body))
+      rescue JSON::ParserError
+        body
+      end
+    end
+    print body unless body.nil?
+    $stdout.puts if body && !body.empty? && !body.end_with?("\n")
+  end
+end
+
+exit response.success? ? 0 : 1

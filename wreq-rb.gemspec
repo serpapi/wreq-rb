@@ -15,6 +15,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 2.7.0"
 
   spec.files = Dir[
+    "exe/*",
     "lib/**/*.rb",
     "ext/**/*.{rs,toml,lock,rb}",
     "vendor/wreq/**/*.{rs,toml}",
@@ -27,6 +28,8 @@ Gem::Specification.new do |spec|
     "README.md",
   ]
 
+  spec.bindir        = "exe"
+  spec.executables   = ["wreq"]
   spec.require_paths = ["lib"]
   spec.extensions    = ["ext/wreq_rb/extconf.rb"]
 
