@@ -84,7 +84,16 @@ client = Wreq::Client.new(
   ],
   headers: {                   # default headers for all requests
     "Accept" => "application/json"
-  }
+  },
+  referer: true,               # auto-set Referer header on redirects (default: true)
+  pool_max_idle_per_host: 10,  # max idle connections per host
+  pool_max_size: 100,          # max total connections in the pool
+  tcp_nodelay: true,           # disable Nagle algorithm (default: true)
+  tcp_keepalive: 15,           # SO_KEEPALIVE interval in seconds (default: 15)
+  local_address: "1.2.3.4",    # bind outgoing connections to this source IP
+  tls_sni: true,               # send SNI in TLS handshake (default: true)
+  min_tls_version: "tls1.2",   # minimum TLS version: tls1.0, tls1.1, tls1.2, tls1.3
+  max_tls_version: "tls1.3",   # maximum TLS version
 )
 
 resp = client.get("https://api.example.com/data")

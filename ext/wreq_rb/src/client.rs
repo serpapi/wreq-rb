@@ -10,7 +10,9 @@ use magnus::{
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+use std::net::IpAddr;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::tls::TlsVersion;
 use wreq_util::{Emulation as BrowserEmulation, EmulationOS, EmulationOption};
 
 use crate::error::{generic_error, to_magnus_error};
@@ -299,6 +301,44 @@ impl Client {
             if let Some(v) = hash_get_bool(&opts, "zstd")? {
                 builder = builder.zstd(v);
             }
+
+            if let Some(v) = hash_get_bool(&opts, "referer")? {
+                builder = builder.referer(v);
+            }
+
+            if let Some(n) = hash_get_usize(&opts, "pool_max_idle_per_host")? {
+                builder = builder.pool_max_idle_per_host(n);
+            }
+
+            if let Some(n) = hash_get_u32(&opts, "pool_max_size")? {
+                builder = builder.pool_max_size(n);
+            }
+
+            if let Some(v) = hash_get_bool(&opts, "tcp_nodelay")? {
+                builder = builder.tcp_nodelay(v);
+            }
+
+            if let Some(t) = hash_get_float(&opts, "tcp_keepalive")? {
+                builder = builder.tcp_keepalive(Duration::from_secs_f64(t));
+            }
+
+            if let Some(addr_str) = hash_get_string(&opts, "local_address")? {
+                let addr: IpAddr = addr_str.parse()
+                    .map_err(|_| generic_error(format!("invalid IP address: '{}'", addr_str)))?;
+                builder = builder.local_address(addr);
+            }
+
+            if let Some(v) = hash_get_bool(&opts, "tls_sni")? {
+                builder = builder.tls_sni(v);
+            }
+
+            if let Some(s) = hash_get_string(&opts, "min_tls_version")? {
+                builder = builder.min_tls_version(parse_tls_version(&s)?);
+            }
+
+            if let Some(s) = hash_get_string(&opts, "max_tls_version")? {
+                builder = builder.max_tls_version(parse_tls_version(&s)?);
+            }
         } else {
             builder = builder.emulation(DEFAULT_EMULATION);
         }
@@ -532,6 +572,32 @@ fn hash_get_bool(hash: &RHash, key: &str) -> Result<Option<bool>, magnus::Error>
     match hash_get_value(hash, key)? {
         Some(v) => Ok(Some(TryConvert::try_convert(v)?)),
         None => Ok(None),
+    }
+}
+
+fn hash_get_usize(hash: &RHash, key: &str) -> Result<Option<usize>, magnus::Error> {
+    match hash_get_value(hash, key)? {
+        Some(v) => Ok(Some(TryConvert::try_convert(v)?)),
+        None => Ok(None),
+    }
+}
+
+fn hash_get_u32(hash: &RHash, key: &str) -> Result<Option<u32>, magnus::Error> {
+    match hash_get_value(hash, key)? {
+        Some(v) => Ok(Some(TryConvert::try_convert(v)?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_tls_version(s: &str) -> Result<TlsVersion, magnus::Error> {
+    match s {
+        "tls1.0" | "tls_1_0" | "1.0" => Ok(TlsVersion::TLS_1_0),
+        "tls1.1" | "tls_1_1" | "1.1" => Ok(TlsVersion::TLS_1_1),
+        "tls1.2" | "tls_1_2" | "1.2" => Ok(TlsVersion::TLS_1_2),
+        "tls1.3" | "tls_1_3" | "1.3" => Ok(TlsVersion::TLS_1_3),
+        _ => Err(generic_error(format!(
+            "unknown TLS version '{}'. Use: 'tls1.2', 'tls1.3'", s
+        ))),
     }
 }
 
