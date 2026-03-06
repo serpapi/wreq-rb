@@ -128,7 +128,7 @@ resp = Wreq.get("https://tls.peet.ws/api/all")
 
 # Explicit browser emulation
 client = Wreq::Client.new(emulation: "firefox_146")
-client = Wreq::Client.new(emulation: "safari_18_5")
+client = Wreq::Client.new(emulation: "safari_18.5")
 client = Wreq::Client.new(emulation: "edge_142")
 
 # Disable emulation entirely
@@ -142,7 +142,7 @@ client = Wreq::Client.new(emulation: "chrome_145", emulation_os: "linux")
 client = Wreq::Client.new(emulation: "chrome_143", user_agent: "MyBot/1.0")
 
 # Per-request emulation override
-resp = client.get("https://example.com", emulation: "safari_26_2")
+resp = client.get("https://example.com", emulation: "safari_26.2")
 ```
 
 ### Supported Browsers
