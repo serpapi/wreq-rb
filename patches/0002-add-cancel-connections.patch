@@ -1,0 +1,169 @@
+diff --git a/src/client/http.rs b/src/client/http.rs
+index 462c77d0..6231e700 100644
+--- a/src/client/http.rs
++++ b/src/client/http.rs
+@@ -171,6 +171,7 @@ type ClientRef = Either<ClientService, BoxedClientService>;
+ #[derive(Clone)]
+ pub struct Client {
+     inner: Arc<ClientRef>,
++    cancel_connections: Arc<dyn Fn() + Send + Sync>,
+ }
+ 
+ /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
+@@ -439,6 +440,14 @@ impl Client {
+         let fut = Oneshot::new(self.inner.as_ref().clone(), req);
+         Pending::request(uri, fut)
+     }
++
++    /// Cancel all background connection tasks immediately.
++    ///
++    /// This force-drops every tracked H1/H2 connection task, causing the
++    /// underlying TCP socket to close abruptly.
++    pub fn cancel_connections(&self) {
++        (self.cancel_connections)()
++    }
+ }
+ 
+ impl tower::Service<Request> for Client {
+@@ -495,7 +504,7 @@ impl ClientBuilder {
+         }
+ 
+         // Create base client service
+-        let service = {
++        let (service, cancel_connections) = {
+             let (tls_options, http1_options, http2_options) = config.transport_options.into();
+ 
+             let resolver = {
+@@ -555,7 +564,7 @@ impl ClientBuilder {
+                 .build(config.connector_layers)?;
+ 
+             // Build client
+-            HttpClient::builder(TokioExecutor::new())
++            let http_client = HttpClient::builder(TokioExecutor::new())
+                 .http1_options(http1_options)
+                 .http2_options(http2_options)
+                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
+@@ -564,8 +573,10 @@ impl ClientBuilder {
+                 .pool_idle_timeout(config.pool_idle_timeout)
+                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
+                 .pool_max_size(config.pool_max_size)
+-                .build(connector)
+-                .map_err(Into::into as _)
++                .build(connector);
++            // Capture abort fn before tower layers consume the client
++            let cancel_connections = http_client.cancel_connections_fn();
++            (http_client.map_err(Into::into as _), cancel_connections)
+         };
+ 
+         // Configured client service with layers
+@@ -633,6 +644,7 @@ impl ClientBuilder {
+ 
+         Ok(Client {
+             inner: Arc::new(client),
++            cancel_connections,
+         })
+     }
+ 
+diff --git a/src/client/http/client.rs b/src/client/http/client.rs
+index a29c52dd..c4e9ab57 100644
+--- a/src/client/http/client.rs
++++ b/src/client/http/client.rs
+@@ -10,7 +10,7 @@ use std::{
+     future::Future,
+     num::NonZeroU32,
+     pin::Pin,
+-    sync::Arc,
++    sync::{Arc, Mutex},
+     task::{self, Poll},
+     time::Duration,
+ };
+@@ -119,6 +119,7 @@ pub struct HttpClient<C, B> {
+     h1_builder: conn::http1::Builder,
+     h2_builder: conn::http2::Builder<Exec>,
+     pool: pool::Pool<PoolClient<B>, ConnectIdentity>,
++    conn_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -452,8 +453,8 @@ where
+     + Send
+     + Unpin
+     + 'static {
+-        let executor = self.exec.clone();
+         let pool = self.pool.clone();
++        let conn_abort_handles = self.conn_abort_handles.clone();
+ 
+         let h1_builder = self.h1_builder.clone();
+         let h2_builder = self.h2_builder.clone();
+@@ -513,10 +514,11 @@ where
+                                     trace!(
+                                         "http2 handshake complete, spawning background dispatcher task"
+                                     );
+-                                    executor.execute(
+-                                        conn.map_err(|_e| debug!("client connection error: {}", _e))
+-                                            .map(|_| ()),
+-                                    );
++                                    let h2_conn_future = conn
++                                        .map_err(|_e| debug!("client connection error: {}", _e))
++                                        .map(|_| ());
++                                    let abort_handle = tokio::spawn(h2_conn_future).abort_handle();
++                                    conn_abort_handles.lock().unwrap_or_else(|e| e.into_inner()).push(abort_handle);
+ 
+                                     // Wait for 'conn' to ready up before we
+                                     // declare this tx as usable
+@@ -544,8 +546,7 @@ where
+                                     // Spawn the connection task in the background using the executor.
+                                     // The task manages the HTTP/1.1 connection, including upgrades (e.g., WebSocket).
+                                     // Errors are sent via err_tx to ensure they can be checked if the sender (tx) fails.
+-                                    executor.execute(
+-                                        conn.with_upgrades()
++                                    let h1_conn_future = conn.with_upgrades()
+                                                 .map_err(|e| {
+                                                 // Log the connection error at debug level for diagnostic purposes.
+                                                 debug!("client connection error: {:?}", e);
+@@ -555,8 +556,9 @@ where
+                                                 // (e.g., if the receiver is dropped, which is handled later).
+                                                 let _ = err_tx.send(e);
+                                             })
+-                                            .map(|_| ()),
+-                                    );
++                                            .map(|_| ());
++                                    let abort_handle = tokio::spawn(h1_conn_future).abort_handle();
++                                    conn_abort_handles.lock().unwrap_or_else(|e| e.into_inner()).push(abort_handle);
+ 
+                                     // Log that the client is waiting for the connection to be ready.
+                                     // Readiness indicates the sender (tx) can accept a request without blocking. More actions
+@@ -682,10 +684,25 @@ impl<C: Clone, B> Clone for HttpClient<C, B> {
+             h2_builder: self.h2_builder.clone(),
+             connector: self.connector.clone(),
+             pool: self.pool.clone(),
++            conn_abort_handles: self.conn_abort_handles.clone(),
+         }
+     }
+ }
+ 
++impl<C, B> HttpClient<C, B> {
++    /// Returns a closure that cancels all tracked connection tasks when called.
++    /// Each call drains the handle list and aborts every stored task.
++    pub fn cancel_connections_fn(&self) -> Arc<dyn Fn() + Send + Sync + 'static> {
++        let handles = self.conn_abort_handles.clone();
++        Arc::new(move || {
++            let mut guard = handles.lock().unwrap_or_else(|e| e.into_inner());
++            for handle in guard.drain(..) {
++                handle.abort();
++            }
++        })
++    }
++}
++
+ /// A pooled HTTP connection that can send requests
+ struct PoolClient<B> {
+     conn_info: Connected,
+@@ -998,6 +1015,7 @@ impl Builder {
+             h2_builder: self.h2_builder,
+             connector,
+             pool: pool::Pool::new(self.pool_config, exec, timer),
++            conn_abort_handles: Arc::new(Mutex::new(Vec::new())),
+         }
+     }
+ }

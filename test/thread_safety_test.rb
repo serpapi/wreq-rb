@@ -165,4 +165,37 @@ class ThreadSafetyTest < Minitest::Test
   ensure
     server&.close rescue nil
   end
+
+  def test_cancel_aborts_h2_connection
+    # Verify client.cancel interrupts an in-flight H2 request mid-flight.
+    client = Wreq::Client.new(timeout: 15, http2_only: true, emulation: false)
+
+    error = nil
+    t = Thread.new do
+      client.get("https://httpbin.org/delay/5")
+    rescue => e
+      error = e
+    end
+
+    sleep 0.5
+
+    # cancel() should unblock the in-flight select! immediately.
+    start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    client.cancel
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+
+    assert elapsed < 1,
+      "client.cancel took #{elapsed.round(2)}s (expected < 1s)"
+
+    t.join(3)
+    assert !t.alive?,
+      "thread still alive 3s after cancel (expected in-flight request to be interrupted)"
+
+    assert_kind_of Wreq::Error, error
+    assert_match "request interrupted", error.message
+
+    # Client should still be usable — a new H2 connection is established.
+    resp = client.get("https://httpbin.org/get")
+    assert_equal 200, resp.status
+  end
 end

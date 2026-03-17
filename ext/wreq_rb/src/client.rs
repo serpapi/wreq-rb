@@ -180,6 +180,7 @@ fn build_emulation_option(
 #[magnus::wrap(class = "Wreq::Client", free_immediately)]
 struct Client {
     inner: wreq::Client,
+    cancel_token: std::sync::Mutex<CancellationToken>,
 }
 
 impl Client {
@@ -344,7 +345,7 @@ impl Client {
         }
 
         let client = builder.build().map_err(to_magnus_error)?;
-        Ok(Client { inner: client })
+        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()) })
     }
 
     /// client.get(url) or client.get(url, opts)
@@ -376,6 +377,19 @@ impl Client {
         self.execute_method("OPTIONS", args)
     }
 
+    fn cancel(&self) {
+        // Replace the cancel token first so new requests use a fresh token,
+        // then cancel the old one to unblock all current in-flight select!s.
+        let old_token = {
+            let mut guard = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner());
+            let old = guard.clone();
+            *guard = CancellationToken::new();
+            old
+        };
+        old_token.cancel();
+        self.inner.cancel_connections();
+    }
+
     fn execute_method(&self, method_str: &str, args: &[Value]) -> Result<Response, magnus::Error> {
         let url: String = if args.is_empty() {
             return Err(generic_error("url is required"));
@@ -399,13 +413,16 @@ impl Client {
             req = apply_request_options(req, &opts)?;
         }
 
+        let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
         // Release the GVL so other Ruby threads can run during I/O.
         let outcome: RequestOutcome = unsafe {
-            without_gvl(|cancel| {
+            without_gvl(|thread_token| {
                 runtime().block_on(async {
                     tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => RequestOutcome::Interrupted,
+                        _ = thread_token.cancelled() => RequestOutcome::Interrupted,
+                        _ = client_token.cancelled() => RequestOutcome::Interrupted,
                         res = execute_request(req) => match res {
                             Ok(data) => RequestOutcome::Ok(data),
                             Err(e) => RequestOutcome::Err(e),
@@ -682,6 +699,7 @@ pub fn init(_ruby: &magnus::Ruby, module: &magnus::RModule) -> Result<(), magnus
     client_class.define_method("delete", method!(Client::delete, -1))?;
     client_class.define_method("head", method!(Client::head, -1))?;
     client_class.define_method("options", method!(Client::options, -1))?;
+    client_class.define_method("cancel", method!(Client::cancel, 0))?;
 
     module.define_module_function("get", function!(wreq_get, -1))?;
     module.define_module_function("post", function!(wreq_post, -1))?;
