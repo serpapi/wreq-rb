@@ -192,7 +192,8 @@ impl Client {
             Some(RHash::try_convert(args[0])?)
         };
 
-        let mut builder = wreq::Client::builder();
+        let mut builder = wreq::Client::builder()
+            .retry(wreq::retry::Policy::never());
 
         if let Some(opts) = opts {
             // Apply header_order BEFORE emulation so the user's ordering takes precedence
