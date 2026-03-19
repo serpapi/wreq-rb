@@ -388,7 +388,6 @@ impl Client {
             old
         };
         old_token.cancel();
-        self.inner.cancel_connections();
     }
 
     fn execute_method(&self, method_str: &str, args: &[Value]) -> Result<Response, magnus::Error> {

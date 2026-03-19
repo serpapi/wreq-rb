@@ -179,7 +179,6 @@ class ThreadSafetyTest < Minitest::Test
 
     sleep 0.5
 
-    # cancel() should unblock the in-flight select! immediately.
     start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     client.cancel
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
@@ -194,7 +193,7 @@ class ThreadSafetyTest < Minitest::Test
     assert_kind_of Wreq::Error, error
     assert_match "request interrupted", error.message
 
-    # Client should still be usable — a new H2 connection is established.
+    # Client should still be usable — a new connection is established.
     resp = client.get("https://httpbin.org/get")
     assert_equal 200, resp.status
   end

@@ -116,7 +116,7 @@ All methods are available on both `Wreq` (module-level) and `Wreq::Client` (inst
 
 ### Cancelling Requests
 
-Call `cancel` on a client to abort all in-flight requests and close their underlying connections immediately:
+Call `cancel` on a client to interrupt all in-flight requests immediately:
 
 ```ruby
 client = Wreq::Client.new
@@ -124,7 +124,7 @@ client = Wreq::Client.new
 # From another thread:
 t = Thread.new { client.get("https://slow.example.com/big-download") }
 sleep 1
-client.cancel  # all in-flight requests return with "request interrupted" error
+client.cancel  # all in-flight requests raise Wreq::Error with "request interrupted"
 ```
 
 ### Per-Request Options
