@@ -89,4 +89,14 @@ class RequestTest < Minitest::Test
     assert_nil body["headers"]["X-Nil"]
     assert_equal "ok", body["headers"]["X-Str"]
   end
+
+  def test_headers_override_emulation_defaults
+    custom_ua = "MyCustomAgent/1.0"
+    resp = Wreq.get("https://httpbin.org/headers",
+      emulation: "chrome_145",
+      headers: { "User-Agent" => custom_ua })
+    assert_equal 200, resp.status
+    body = resp.json
+    assert_equal custom_ua, body["headers"]["User-Agent"]
+  end
 end

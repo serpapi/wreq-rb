@@ -445,6 +445,21 @@ fn apply_request_options(
     mut req: wreq::RequestBuilder,
     opts: &RHash,
 ) -> Result<wreq::RequestBuilder, magnus::Error> {
+    if let Some(val) = hash_get_value(opts, "emulation")? {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        if val.is_kind_of(ruby.class_false_class()) {
+            // emulation: false — no per-request emulation override
+        } else if val.is_kind_of(ruby.class_true_class()) {
+            let opt = build_emulation_option(DEFAULT_EMULATION, opts)?;
+            req = req.emulation(opt);
+        } else {
+            let name: String = TryConvert::try_convert(val)?;
+            let emu = parse_emulation(&name)?;
+            let opt = build_emulation_option(emu, opts)?;
+            req = req.emulation(opt);
+        }
+    }
+
     if let Some(hdr_hash) = hash_get_hash(opts, "headers")? {
         let hmap = hash_to_header_map(&hdr_hash)?;
         req = req.headers(hmap);
@@ -497,21 +512,6 @@ fn apply_request_options(
     if let Some(proxy_url) = hash_get_string(opts, "proxy")? {
         let proxy = wreq::Proxy::all(&proxy_url).map_err(to_magnus_error)?;
         req = req.proxy(proxy);
-    }
-
-    if let Some(val) = hash_get_value(opts, "emulation")? {
-        let ruby = unsafe { Ruby::get_unchecked() };
-        if val.is_kind_of(ruby.class_false_class()) {
-            // emulation: false — no per-request emulation override
-        } else if val.is_kind_of(ruby.class_true_class()) {
-            let opt = build_emulation_option(DEFAULT_EMULATION, opts)?;
-            req = req.emulation(opt);
-        } else {
-            let name: String = TryConvert::try_convert(val)?;
-            let emu = parse_emulation(&name)?;
-            let opt = build_emulation_option(emu, opts)?;
-            req = req.emulation(opt);
-        }
     }
 
     Ok(req)
