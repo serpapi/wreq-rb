@@ -210,3 +210,7 @@ bundle install
 bundle exec rake compile
 bundle exec rake test
 ```
+
+## License
+
+wreq-rb is released under the [Apache License, Version 2.0](LICENSE).

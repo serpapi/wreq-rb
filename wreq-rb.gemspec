@@ -11,7 +11,7 @@ Gem::Specification.new do |spec|
                         "featuring TLS fingerprint emulation (JA3/JA4), HTTP/2 support, " \
                         "cookie handling, proxy support, and redirect policies."
   spec.homepage      = "https://github.com/serpapi/wreq-rb"
-  spec.license       = "MIT"
+  spec.license       = "Apache-2.0"
   spec.required_ruby_version = ">= 2.7.0"
 
   spec.files = Dir[
