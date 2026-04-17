@@ -12,7 +12,7 @@ Gem::Specification.new do |spec|
                         "cookie handling, proxy support, and redirect policies."
   spec.homepage      = "https://github.com/serpapi/wreq-rb"
   spec.license       = "Apache-2.0"
-  spec.required_ruby_version = ">= 2.7.0"
+  spec.required_ruby_version = ">= 3.0.0"
 
   spec.files = Dir[
     "exe/*",
@@ -33,6 +33,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions    = ["ext/wreq_rb/extconf.rb"]
 
-  # 0.9.123 is the last version that uses rake-compiler-dock 1.10.0 (Ruby 2.7 support)
-  spec.add_dependency "rb_sys", "0.9.123"
+  # 0.9.124+ uses rake-compiler-dock 1.11.0, which adds Ruby 4.0 cross-compilation
+  # support and drops Ruby 2.7. Bumping to 0.9.126 (latest patch).
+  spec.add_dependency "rb_sys", "0.9.126"
 end

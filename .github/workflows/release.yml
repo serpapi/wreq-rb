@@ -61,7 +61,7 @@ jobs:
         id: cross-gem
         with:
           platform: ${{ matrix.platform }}
-          ruby-versions: "2.7,3.3,3.4"
+          ruby-versions: "3.3,3.4,4.0"
           cache-version: v2
 
       - uses: actions/upload-artifact@v6
@@ -107,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ruby: ["2.7", "3.4"]
+        ruby: ["3.3", "3.4", "4.0"]
     steps:
       - uses: actions/checkout@v6
         with:
