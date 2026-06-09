@@ -8,21 +8,21 @@ class ClientTest < Minitest::Test
       user_agent: "wreq-rb-test/0.1",
       timeout: 30
     )
-    resp = client.get("https://httpbin.org/user-agent")
+    resp = client.get("https://httpbun.com/headers")
     assert_equal 200, resp.status
     body = resp.json
-    assert_equal "wreq-rb-test/0.1", body["user-agent"]
+    assert_equal "wreq-rb-test/0.1", body["headers"]["User-Agent"]
   end
 
   def test_redirect_client
     client = Wreq::Client.new(redirect: 5)
-    resp = client.get("https://httpbin.org/redirect/2")
+    resp = client.get("https://httpbun.com/redirect/2")
     assert_equal 200, resp.status
   end
 
   def test_http1_only
     client = Wreq::Client.new(http1_only: true)
-    resp = client.get("https://httpbin.org/get")
+    resp = client.get("https://httpbun.com/get")
     assert_equal 200, resp.status
     assert_equal "HTTP/1.1", resp.version,
       "Expected HTTP/1.1 when http1_only: true, got #{resp.version}"
@@ -30,7 +30,7 @@ class ClientTest < Minitest::Test
 
   def test_http2_only
     client = Wreq::Client.new(http2_only: true)
-    resp = client.get("https://httpbin.org/get")
+    resp = client.get("https://httpbun.com/get")
     assert_equal 200, resp.status
     assert_equal "HTTP/2.0", resp.version,
       "Expected HTTP/2.0 when http2_only: true, got #{resp.version}"
@@ -40,7 +40,7 @@ class ClientTest < Minitest::Test
     client = Wreq::Client.new(
       headers: { :"X-Symbol" => 99, "X-Nil" => nil, "X-Str" => "ok" }
     )
-    resp = client.get("https://httpbin.org/headers")
+    resp = client.get("https://httpbun.com/headers")
     assert_equal 200, resp.status
     body = resp.json
     assert_equal "99", body["headers"]["X-Symbol"]

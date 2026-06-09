@@ -4,7 +4,7 @@ require_relative "test_helper"
 
 class ResponseTest < Minitest::Test
   def test_response_methods
-    resp = Wreq.get("https://httpbin.org/get")
+    resp = Wreq.get("https://httpbun.com/get")
     assert_kind_of Integer, resp.status
     assert_kind_of String, resp.text
     assert_kind_of String, resp.url
@@ -13,8 +13,8 @@ class ResponseTest < Minitest::Test
   end
 
   def test_transfer_size_with_compressed_response
-    # /gzip returns gzip-compressed data; transfer_size should be smaller than body
-    resp = Wreq.get("https://httpbin.org/gzip")
+    # example.com serves gzip-compressed HTML; transfer_size should be smaller than body
+    resp = Wreq.get("https://www.example.com")
     assert_equal 200, resp.status
 
     body_size = resp.body_bytes.length
@@ -28,7 +28,7 @@ class ResponseTest < Minitest::Test
 
   def test_transfer_size_with_uncompressed_response
     # /robots.txt is small and typically not compressed; sizes should match
-    resp = Wreq.get("https://httpbin.org/robots.txt")
+    resp = Wreq.get("https://httpbun.com/robots.txt")
     assert_equal 200, resp.status
 
     body_size = resp.body_bytes.length
@@ -40,7 +40,7 @@ class ResponseTest < Minitest::Test
   end
 
   def test_headers_values_are_arrays
-    resp = Wreq.get("https://httpbin.org/get")
+    resp = Wreq.get("https://httpbun.com/get")
     assert_equal 200, resp.status
     headers = resp.headers
     assert_kind_of Hash, headers
@@ -56,7 +56,7 @@ class ResponseTest < Minitest::Test
 
   def test_headers_multiple_set_cookie
     client = Wreq::Client.new(redirect: false)
-    resp = client.get("https://httpbin.org/cookies/set?a=1&b=2")
+    resp = client.get("https://httpbun.com/cookies/set?a=1&b=2")
     headers = resp.headers
     cookies = headers["set-cookie"]
     assert_kind_of Array, cookies, "set-cookie should be an Array"

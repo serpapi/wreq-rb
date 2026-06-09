@@ -4,14 +4,14 @@ require_relative "test_helper"
 
 class RequestTest < Minitest::Test
   def test_simple_get
-    resp = Wreq.get("https://httpbin.org/get")
+    resp = Wreq.get("https://httpbun.com/get")
     assert_equal 200, resp.status
     assert resp.success?
     refute resp.text.empty?
   end
 
   def test_get_with_headers
-    resp = Wreq.get("https://httpbin.org/headers",
+    resp = Wreq.get("https://httpbun.com/headers",
       headers: { "X-Test-Header" => "hello" })
     assert_equal 200, resp.status
     body = resp.json
@@ -19,7 +19,7 @@ class RequestTest < Minitest::Test
   end
 
   def test_post_json
-    resp = Wreq.post("https://httpbin.org/post",
+    resp = Wreq.post("https://httpbun.com/post",
       json: { "name" => "wreq", "version" => 1 })
     assert_equal 200, resp.status
     body = resp.json
@@ -28,7 +28,7 @@ class RequestTest < Minitest::Test
   end
 
   def test_post_form
-    resp = Wreq.post("https://httpbin.org/post",
+    resp = Wreq.post("https://httpbun.com/post",
       form: { "key" => "value" })
     assert_equal 200, resp.status
     body = resp.json
@@ -36,7 +36,7 @@ class RequestTest < Minitest::Test
   end
 
   def test_query_params
-    resp = Wreq.get("https://httpbin.org/get",
+    resp = Wreq.get("https://httpbun.com/get",
       query: { "foo" => "bar", "baz" => "qux" })
     assert_equal 200, resp.status
     body = resp.json
@@ -45,12 +45,12 @@ class RequestTest < Minitest::Test
   end
 
   def test_head_request
-    resp = Wreq.head("https://httpbin.org/get")
+    resp = Wreq.head("https://httpbun.com/any")
     assert_equal 200, resp.status
   end
 
   def test_put_request
-    resp = Wreq.put("https://httpbin.org/put",
+    resp = Wreq.put("https://httpbun.com/put",
       body: "test body")
     assert_equal 200, resp.status
     body = resp.json
@@ -58,30 +58,30 @@ class RequestTest < Minitest::Test
   end
 
   def test_delete_request
-    resp = Wreq.delete("https://httpbin.org/delete")
+    resp = Wreq.delete("https://httpbun.com/delete")
     assert_equal 200, resp.status
   end
 
   def test_patch_request
-    resp = Wreq.patch("https://httpbin.org/patch",
+    resp = Wreq.patch("https://httpbun.com/patch",
       json: { "patched" => true })
     assert_equal 200, resp.status
   end
 
   def test_bearer_auth
-    resp = Wreq.get("https://httpbin.org/bearer",
+    resp = Wreq.get("https://httpbun.com/bearer/test-token-123",
       bearer: "test-token-123")
     assert_equal 200, resp.status
   end
 
   def test_basic_auth
-    resp = Wreq.get("https://httpbin.org/basic-auth/user/pass",
+    resp = Wreq.get("https://httpbun.com/basic-auth/user/pass",
       basic: ["user", "pass"])
     assert_equal 200, resp.status
   end
 
   def test_headers_with_mixed_types
-    resp = Wreq.get("https://httpbin.org/headers",
+    resp = Wreq.get("https://httpbun.com/headers",
       headers: { :"X-Symbol" => 99, "X-Nil" => nil, "X-Str" => "ok" })
     assert_equal 200, resp.status
     body = resp.json
@@ -92,7 +92,7 @@ class RequestTest < Minitest::Test
 
   def test_headers_override_emulation_defaults
     custom_ua = "MyCustomAgent/1.0"
-    resp = Wreq.get("https://httpbin.org/headers",
+    resp = Wreq.get("https://httpbun.com/headers",
       emulation: "chrome_145",
       headers: { "User-Agent" => custom_ua })
     assert_equal 200, resp.status

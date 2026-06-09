@@ -14,7 +14,7 @@ class ThreadSafetyTest < Minitest::Test
     start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     threads = num_threads.times.map do
       Thread.new do
-        resp = client.get("https://httpbin.org/delay/#{delay}")
+        resp = client.get("https://httpbun.com/delay/#{delay}")
         resp.status
       end
     end
@@ -39,7 +39,7 @@ class ThreadSafetyTest < Minitest::Test
     stop = false
 
     request_thread = Thread.new do
-      client.get("https://httpbin.org/delay/2")
+      client.get("https://httpbun.com/delay/2")
     end
 
     # Let the request thread start and enter the native blocking call
@@ -72,7 +72,7 @@ class ThreadSafetyTest < Minitest::Test
     t = Thread.new do
       begin
         # This endpoint delays 10s, but we'll kill the thread much sooner.
-        client.get("https://httpbin.org/delay/10")
+        client.get("https://httpbun.com/delay/10")
       rescue => e
         error = e
       end
@@ -172,7 +172,7 @@ class ThreadSafetyTest < Minitest::Test
 
     error = nil
     t = Thread.new do
-      client.get("https://httpbin.org/delay/5")
+      client.get("https://httpbun.com/delay/5")
     rescue => e
       error = e
     end
@@ -194,7 +194,7 @@ class ThreadSafetyTest < Minitest::Test
     assert_match "request interrupted", error.message
 
     # Client should still be usable — a new connection is established.
-    resp = client.get("https://httpbin.org/get")
+    resp = client.get("https://httpbun.com/get")
     assert_equal 200, resp.status
   end
 end
