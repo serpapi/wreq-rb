@@ -17,7 +17,7 @@
 set(CMAKE_SYSTEM_NAME Darwin)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_OSX_ARCHITECTURES x86_64)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "10.14")
 
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
     # osxcross compiler wrappers (available inside the rb-sys-dock container)
