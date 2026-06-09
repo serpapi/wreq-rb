@@ -1,60 +1,51 @@
-diff --git a/src/client/http.rs b/src/client/http.rs
-index 10be0c83..462c77d0 100644
---- a/src/client/http.rs
-+++ b/src/client/http.rs
-@@ -33,6 +33,7 @@ use self::future::Pending;
-     feature = "deflate",
- ))]
- use super::layer::decoder::{AcceptEncoding, DecompressionLayer};
-+use super::layer::transfer_size::{CountingBody, TransferSizeLayer, TransferSizeService};
- #[cfg(feature = "ws")]
- use super::ws::WebSocketRequestBuilder;
- use super::{
-@@ -104,7 +105,7 @@ type Decompression<T> = super::layer::decoder::Decompression<T>;
-     feature = "brotli",
-     feature = "deflate"
- ))]
--type ResponseBody = TimeoutBody<tower_http::decompression::DecompressionBody<Incoming>>;
-+type ResponseBody = TimeoutBody<tower_http::decompression::DecompressionBody<CountingBody<Incoming>>>;
- 
- /// Response body type with timeout only (no compression features).
- #[cfg(not(any(
-@@ -113,23 +114,25 @@ type ResponseBody = TimeoutBody<tower_http::decompression::DecompressionBody<Inc
-     feature = "brotli",
-     feature = "deflate"
- )))]
--type ResponseBody = TimeoutBody<Incoming>;
-+type ResponseBody = TimeoutBody<CountingBody<Incoming>>;
- 
- /// The complete HTTP client service stack with all middleware layers.
+diff --git a/src/client.rs b/src/client.rs
+index 4abe25d8..76e709a8 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -49,6 +49,7 @@ use self::{
+         redirect::{FollowRedirect, FollowRedirectLayer},
+         retry::RetryPolicy,
+         timeout::{Timeout, TimeoutLayer, TimeoutOptions, body::TimeoutBody},
++        transfer_size::{CountingBody, TransferSizeLayer, TransferSizeService},
+     },
+     request::{Request, RequestBuilder},
+     response::Response,
+@@ -115,25 +116,30 @@ type MaybeDecompressionBody<T> = tower_http::decompression::DecompressionBody<T>
  type ClientService = Timeout<
-     ResponseBodyTimeout<
-         ConfigService<
-             Decompression<
--                Retry<
--                    RetryPolicy,
--                    FollowRedirect<
--                        CookieService<
--                            MapErr<
--                                HttpClient<Connector, Body>,
--                                fn(client::error::Error) -> BoxError,
-+                TransferSizeService<
-+                    Retry<
-+                        RetryPolicy,
-+                        FollowRedirect<
-+                            CookieService<
-+                                MapErr<
-+                                    HttpClient<Connector, Body>,
-+                                    fn(client::error::Error) -> BoxError,
-+                                >,
-                             >,
-+                            FollowRedirectPolicy,
-                         >,
--                        FollowRedirectPolicy,
-                     >,
-                 >,
-             >,
-@@ -582,6 +585,10 @@ impl ClientBuilder {
+     ConfigService<
+         MaybeDecompression<
+-            Retry<RetryPolicy, FollowRedirect<HttpClient<Connector, Body>, FollowRedirectPolicy>>,
++            TransferSizeService<
++                Retry<
++                    RetryPolicy,
++                    FollowRedirect<HttpClient<Connector, Body>, FollowRedirectPolicy>,
++                >,
++            >,
+         >,
+     >,
+ >;
+ 
+ type BoxedClientService = BoxCloneSyncService<
+     http::Request<Body>,
+-    http::Response<TimeoutBody<MaybeDecompressionBody<Incoming>>>,
++    http::Response<TimeoutBody<MaybeDecompressionBody<CountingBody<Incoming>>>>,
+     BoxError,
+ >;
+ 
+ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
+     BoxCloneSyncService<
+         http::Request<Body>,
+-        http::Response<MaybeDecompressionBody<Incoming>>,
++        http::Response<MaybeDecompressionBody<CountingBody<Incoming>>>,
+         BoxError,
+     >,
+     http::Request<Body>,
+-    http::Response<MaybeDecompressionBody<Incoming>>,
++    http::Response<MaybeDecompressionBody<CountingBody<Incoming>>>,
+     BoxError,
+ >;
+ 
+@@ -593,6 +599,10 @@ impl ClientBuilder {
                  })
                  .service(service);
  
@@ -65,18 +56,36 @@ index 10be0c83..462c77d0 100644
              #[cfg(any(
                  feature = "gzip",
                  feature = "zstd",
+@@ -1585,7 +1595,7 @@ impl ClientBuilder {
+         L: Layer<
+                 BoxCloneSyncService<
+                     http::Request<Body>,
+-                    http::Response<MaybeDecompressionBody<Incoming>>,
++                    http::Response<MaybeDecompressionBody<CountingBody<Incoming>>>,
+                     BoxError,
+                 >,
+             > + Clone
+@@ -1594,7 +1604,7 @@ impl ClientBuilder {
+             + 'static,
+         L::Service: Service<
+                 http::Request<Body>,
+-                Response = http::Response<MaybeDecompressionBody<Incoming>>,
++                Response = http::Response<MaybeDecompressionBody<CountingBody<Incoming>>>,
+                 Error = BoxError,
+             > + Clone
+             + Send
 diff --git a/src/client/layer.rs b/src/client/layer.rs
-index 05bb533f..cb0b0866 100644
+index 5c03ef4d..fe37cff0 100644
 --- a/src/client/layer.rs
 +++ b/src/client/layer.rs
-@@ -13,3 +13,4 @@ pub mod decoder;
+@@ -12,3 +12,4 @@ pub mod decoder;
  pub mod redirect;
  pub mod retry;
  pub mod timeout;
 +pub mod transfer_size;
 diff --git a/src/client/layer/transfer_size.rs b/src/client/layer/transfer_size.rs
 new file mode 100644
-index 00000000..7e8a4390
+index 00000000..f155ec8d
 --- /dev/null
 +++ b/src/client/layer/transfer_size.rs
 @@ -0,0 +1,176 @@
@@ -91,8 +100,8 @@ index 00000000..7e8a4390
 +use std::{
 +    pin::Pin,
 +    sync::{
-+        atomic::{AtomicU64, Ordering},
 +        Arc,
++        atomic::{AtomicU64, Ordering},
 +    },
 +    task::{Context, Poll},
 +};
@@ -257,18 +266,18 @@ index 00000000..7e8a4390
 +    }
 +}
 diff --git a/src/client/response.rs b/src/client/response.rs
-index d98859b9..16ed35c3 100644
+index 3d3532af..ed478804 100644
 --- a/src/client/response.rs
 +++ b/src/client/response.rs
-@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
- use super::{
-     conn::HttpInfo,
-     core::{ext::ReasonPhrase, upgrade},
-+    layer::transfer_size::TransferSizeHandle,
- };
+@@ -18,6 +18,7 @@ use mime::Mime;
+ use serde::de::DeserializeOwned;
+ use wreq_proto::ext::ReasonPhrase;
+ 
++use super::layer::transfer_size::TransferSizeHandle;
  #[cfg(feature = "cookies")]
  use crate::cookie;
-@@ -91,6 +92,21 @@ impl Response {
+ use crate::{
+@@ -97,6 +98,21 @@ impl Response {
          HttpBody::size_hint(self.res.body()).exact()
      }
  

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::tls::TlsVersion;
-use wreq_util::{Emulation as BrowserEmulation, EmulationOS, EmulationOption};
+use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
 
 use crate::error::{generic_error, to_magnus_error};
 use crate::response::Response;
@@ -141,35 +141,35 @@ async fn execute_request(req: wreq::RequestBuilder) -> Result<ResponseData, wreq
 // Emulation helpers
 // --------------------------------------------------------------------------
 
-/// The default emulation to apply when none is specified.
-const DEFAULT_EMULATION: BrowserEmulation = BrowserEmulation::Chrome145;
+/// The default browser profile to apply when none is specified.
+const DEFAULT_EMULATION: BrowserProfile = BrowserProfile::Chrome148;
 
-/// Parse a Ruby string like "chrome_143" into a BrowserEmulation variant.
-fn parse_emulation(name: &str) -> Result<BrowserEmulation, magnus::Error> {
+/// Parse a Ruby string like "chrome_143" into a BrowserProfile variant.
+fn parse_emulation(name: &str) -> Result<BrowserProfile, magnus::Error> {
     let json_val = serde_json::Value::String(name.to_string());
-    serde_json::from_value::<BrowserEmulation>(json_val)
-        .map_err(|_| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_145', 'firefox_147', 'safari_18.5', etc.", name)))
+    serde_json::from_value::<BrowserProfile>(json_val)
+        .map_err(|_| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_148', 'firefox_151', 'safari_18.5', etc.", name)))
 }
 
-/// Parse a Ruby string like "windows" into an EmulationOS variant.
-fn parse_emulation_os(name: &str) -> Result<EmulationOS, magnus::Error> {
+/// Parse a Ruby string like "windows" into an EmulationPlatform variant.
+fn parse_emulation_os(name: &str) -> Result<EmulationPlatform, magnus::Error> {
     let json_val = serde_json::Value::String(name.to_string());
-    serde_json::from_value::<EmulationOS>(json_val)
+    serde_json::from_value::<EmulationPlatform>(json_val)
         .map_err(|_| generic_error("unknown emulation_os. Use: 'windows', 'macos', 'linux', 'android', 'ios'"))
 }
 
-/// Build an EmulationOption from an Emulation and an optional OS from the opts hash.
+/// Build a BrowserEmulation from a profile and an optional platform from the opts hash.
 fn build_emulation_option(
-    emu: BrowserEmulation,
+    profile: BrowserProfile,
     opts: &RHash,
-) -> Result<EmulationOption, magnus::Error> {
-    let os = match hash_get_string(opts, "emulation_os")? {
-        Some(os_name) => parse_emulation_os(&os_name)?,
-        None => EmulationOS::default(),
+) -> Result<BrowserEmulation, magnus::Error> {
+    let platform = match hash_get_string(opts, "emulation_os")? {
+        Some(platform_name) => parse_emulation_os(&platform_name)?,
+        None => EmulationPlatform::default(),
     };
-    Ok(EmulationOption::builder()
-        .emulation(emu)
-        .emulation_os(os)
+    Ok(BrowserEmulation::builder()
+        .profile(profile)
+        .platform(platform)
         .build())
 }
 
@@ -277,11 +277,11 @@ impl Client {
             }
 
             if let Some(v) = hash_get_bool(&opts, "verify_host")? {
-                builder = builder.verify_hostname(v);
+                builder = builder.tls_verify_hostname(v);
             }
 
             if let Some(v) = hash_get_bool(&opts, "verify_cert")? {
-                builder = builder.cert_verification(v);
+                builder = builder.tls_cert_verification(v);
             }
 
             if let Some(true) = hash_get_bool(&opts, "http1_only")? {
@@ -312,7 +312,7 @@ impl Client {
                 builder = builder.pool_max_idle_per_host(n);
             }
 
-            if let Some(n) = hash_get_u32(&opts, "pool_max_size")? {
+            if let Some(n) = hash_get_usize(&opts, "pool_max_size")? {
                 builder = builder.pool_max_size(n);
             }
 
@@ -335,11 +335,11 @@ impl Client {
             }
 
             if let Some(s) = hash_get_string(&opts, "min_tls_version")? {
-                builder = builder.min_tls_version(parse_tls_version(&s)?);
+                builder = builder.tls_min_version(parse_tls_version(&s)?);
             }
 
             if let Some(s) = hash_get_string(&opts, "max_tls_version")? {
-                builder = builder.max_tls_version(parse_tls_version(&s)?);
+                builder = builder.tls_max_version(parse_tls_version(&s)?);
             }
         } else {
             builder = builder.emulation(DEFAULT_EMULATION);
@@ -593,13 +593,6 @@ fn hash_get_bool(hash: &RHash, key: &str) -> Result<Option<bool>, magnus::Error>
 }
 
 fn hash_get_usize(hash: &RHash, key: &str) -> Result<Option<usize>, magnus::Error> {
-    match hash_get_value(hash, key)? {
-        Some(v) => Ok(Some(TryConvert::try_convert(v)?)),
-        None => Ok(None),
-    }
-}
-
-fn hash_get_u32(hash: &RHash, key: &str) -> Result<Option<u32>, magnus::Error> {
     match hash_get_value(hash, key)? {
         Some(v) => Ok(Some(TryConvert::try_convert(v)?)),
         None => Ok(None),
