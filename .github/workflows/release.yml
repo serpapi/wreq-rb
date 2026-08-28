@@ -57,12 +57,13 @@ jobs:
           ruby-version: "3.3"
           bundler-cache: true
 
-      - uses: oxidize-rb/actions/cross-gem@v1
+      - uses: oxidize-rb/actions/cross-gem@85175a9d5f63d4491253e957d3fc3f4ed7f17534
         id: cross-gem
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: "2.7,3.3,3.4"
-          cache-version: v2
+          cache-version: v4
+          pre-script: rustup update stable && rustup target add "$RUST_TARGET"
 
       - uses: actions/upload-artifact@v6
         with:
