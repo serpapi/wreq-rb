@@ -201,7 +201,7 @@ async fn execute_batch(reqs: Vec<wreq::RequestBuilder>, concurrency: usize) -> V
 // --------------------------------------------------------------------------
 
 /// The default browser profile to apply when none is specified.
-const DEFAULT_EMULATION: BrowserProfile = BrowserProfile::Chrome148;
+const DEFAULT_EMULATION: BrowserProfile = BrowserProfile::Chrome149;
 
 /// Parse a Ruby string like "chrome_143" into a BrowserProfile variant.
 fn parse_emulation(name: &str) -> Result<BrowserProfile, magnus::Error> {
