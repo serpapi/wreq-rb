@@ -114,6 +114,34 @@ All methods are available on both `Wreq` (module-level) and `Wreq::Client` (inst
 | `head(url, **opts)` | HEAD request |
 | `options(url, **opts)` | OPTIONS request |
 
+### Batch Requests
+
+`Wreq::Client#request_batch` runs many requests concurrently inside a **single**
+GVL release, multiplexed over the client's connection pool. This avoids one Ruby
+thread per request.
+
+```ruby
+client = Wreq::Client.new(redirect: false, pool_max_idle_per_host: 32)
+
+responses = client.request_batch(urls, concurrency: 128)
+```
+
+Each element of the array is either a URL string or a hash:
+
+```ruby
+client.request_batch([
+  "https://example.com/a", # GET
+  { method: :put, url: "https://example.com/b", body: "hi" }
+], concurrency: 32)
+```
+
+- Results are returned **in input order**.
+- Each element is a `Wreq::Response` **or** a `Wreq::Error` — a single failed
+  request never discards the rest of the batch. Errors are returned, not raised.
+- `concurrency` caps the number of in-flight requests and defaults to `16`.
+- `cancel` and Ruby thread interrupts abort the whole batch, raising
+  `Wreq::Error` with `"request interrupted"`.
+
 ### Cancelling Requests
 
 Call `cancel` on a client to interrupt all in-flight requests immediately:
