@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::any::Any;
+use std::sync::Arc;
 use std::time::Duration;
 
 use magnus::{
@@ -9,13 +10,15 @@ use magnus::{
     try_convert::TryConvert, Value,
 };
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::tls::TlsVersion;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
 
-use crate::error::{generic_error, to_magnus_error};
+use crate::error::{generic_error, to_magnus_error, wreq_error};
 use crate::response::Response;
 
 // --------------------------------------------------------------------------
@@ -135,6 +138,62 @@ async fn execute_request(req: wreq::RequestBuilder) -> Result<ResponseData, wreq
     let body = resp.bytes().await?.to_vec();
     let transfer_size = transfer_size_handle.map(|h| h.get());
     Ok(ResponseData { status, headers, body, url, version, content_length, transfer_size })
+}
+
+// --------------------------------------------------------------------------
+// Batch execution
+// --------------------------------------------------------------------------
+
+const DEFAULT_BATCH_CONCURRENCY: usize = 16;
+
+/// Per-item batch result as pure Rust types (no Ruby objects). Errors are kept
+/// as messages so one failure never discards the rest of the batch.
+enum BatchItem {
+    Ok(ResponseData),
+    Err(String),
+}
+
+/// Outcome of a whole batch performed outside the GVL.
+enum BatchOutcome {
+    Done(Vec<BatchItem>),
+    Interrupted,
+}
+
+/// Run every request concurrently with at most `concurrency` in flight,
+/// returning results in input order.
+async fn execute_batch(reqs: Vec<wreq::RequestBuilder>, concurrency: usize) -> Vec<BatchItem> {
+    let permits = Arc::new(Semaphore::new(concurrency));
+    let mut set: JoinSet<(usize, BatchItem)> = JoinSet::new();
+
+    for (idx, req) in reqs.into_iter().enumerate() {
+        let permits = Arc::clone(&permits);
+        set.spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, BatchItem::Err("batch semaphore closed".to_owned())),
+            };
+            let item = match execute_request(req).await {
+                Ok(data) => BatchItem::Ok(data),
+                Err(e) => BatchItem::Err(e.to_string()),
+            };
+            (idx, item)
+        });
+    }
+
+    let mut slots: Vec<Option<BatchItem>> = Vec::new();
+    slots.resize_with(set.len(), || None);
+    while let Some(joined) = set.join_next().await {
+        // A JoinError means the task panicked or was aborted; its slot is left
+        // empty and filled with a generic error below.
+        if let Ok((idx, item)) = joined {
+            slots[idx] = Some(item);
+        }
+    }
+
+    slots
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| BatchItem::Err("request task failed".to_owned())))
+        .collect()
 }
 
 // --------------------------------------------------------------------------
@@ -439,6 +498,120 @@ impl Client {
         };
         Ok(Response::new(data.status, data.headers, data.body, data.url, data.version, data.content_length, data.transfer_size))
     }
+
+    /// Wreq::Client#request_batch(specs) or #request_batch(specs, options)
+    fn request_batch(&self, args: &[Value]) -> Result<RArray, magnus::Error> {
+        if args.is_empty() {
+            return Err(generic_error("an array of requests is required"));
+        }
+        let specs = RArray::try_convert(args[0])?;
+
+        let opts: Option<RHash> = if args.len() > 1 {
+            Some(RHash::try_convert(args[1])?)
+        } else {
+            None
+        };
+
+        let concurrency = match opts.as_ref() {
+            Some(o) => hash_get_usize(o, "concurrency")?.unwrap_or(DEFAULT_BATCH_CONCURRENCY),
+            None => DEFAULT_BATCH_CONCURRENCY,
+        };
+        if concurrency == 0 {
+            return Err(generic_error("concurrency must be >= 1"));
+        }
+
+        // All Ruby -> Rust conversion happens here, while we still hold the GVL.
+        let mut reqs: Vec<wreq::RequestBuilder> = Vec::with_capacity(specs.len());
+        for spec in specs.into_iter() {
+            reqs.push(self.build_request(spec, opts.as_ref())?);
+        }
+
+        let ruby = unsafe { Ruby::get_unchecked() };
+        if reqs.is_empty() {
+            return Ok(ruby.ary_new());
+        }
+
+        let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        // One GVL release covering the whole batch.
+        let outcome: BatchOutcome = unsafe {
+            without_gvl(|thread_token| {
+                runtime().block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = thread_token.cancelled() => BatchOutcome::Interrupted,
+                        _ = client_token.cancelled() => BatchOutcome::Interrupted,
+                        items = execute_batch(reqs, concurrency) => BatchOutcome::Done(items),
+                    }
+                })
+            })
+        };
+
+        let items = match outcome {
+            BatchOutcome::Done(items) => items,
+            BatchOutcome::Interrupted => return Err(generic_error("request interrupted")),
+        };
+
+        // Back under the GVL: Ruby objects may be created again.
+        let results = ruby.ary_new_capa(items.len());
+        for item in items {
+            match item {
+                BatchItem::Ok(d) => {
+                    let resp = Response::new(
+                        d.status, d.headers, d.body, d.url, d.version, d.content_length,
+                        d.transfer_size,
+                    );
+                    results.push(ruby.obj_wrap(resp))?;
+                }
+                BatchItem::Err(msg) => {
+                    let err: Value = wreq_error().funcall("new", (msg,))?;
+                    results.push(err)?;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Convert a single batch spec into a RequestBuilder. Accepted forms:
+    ///   "https://example.com"      -> GET
+    ///   { method:, url:, **opts }
+    fn build_request(
+        &self,
+        spec: Value,
+        shared: Option<&RHash>,
+    ) -> Result<wreq::RequestBuilder, magnus::Error> {
+        let mut method = wreq::Method::GET;
+        let url: String;
+        let mut item_opts: Option<RHash> = None;
+
+        if let Some(hash) = RHash::from_value(spec) {
+            url = hash_get_string(&hash, "url")?
+                .ok_or_else(|| generic_error("each request hash requires a :url"))?;
+            if let Some(val) = hash_get_value(&hash, "method")? {
+                method = value_to_method(val)?;
+            }
+            item_opts = Some(hash);
+        } else {
+            url = TryConvert::try_convert(spec)?;
+        }
+
+        let mut req = self.inner.request(method, &url);
+        if let Some(shared) = shared {
+            req = apply_request_options(req, shared)?;
+        }
+        if let Some(item_opts) = item_opts {
+            req = apply_request_options(req, &item_opts)?;
+        }
+        Ok(req)
+    }
+}
+
+/// Parse a String or Symbol like "post" / :post into an HTTP method.
+fn value_to_method(val: Value) -> Result<wreq::Method, magnus::Error> {
+    let name: String = val.funcall("to_s", ())?;
+    name.to_uppercase()
+        .parse()
+        .map_err(|_| generic_error(format!("invalid HTTP method: {}", name)))
 }
 
 fn apply_request_options(
@@ -692,6 +865,7 @@ pub fn init(_ruby: &magnus::Ruby, module: &magnus::RModule) -> Result<(), magnus
     client_class.define_method("delete", method!(Client::delete, -1))?;
     client_class.define_method("head", method!(Client::head, -1))?;
     client_class.define_method("options", method!(Client::options, -1))?;
+    client_class.define_method("request_batch", method!(Client::request_batch, -1))?;
     client_class.define_method("cancel", method!(Client::cancel, 0))?;
 
     module.define_module_function("get", function!(wreq_get, -1))?;
