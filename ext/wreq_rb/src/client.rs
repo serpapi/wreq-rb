@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::tls::TlsVersion;
+use wreq::IntoEmulation;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
 
 use crate::error::{generic_error, to_magnus_error, wreq_error};
@@ -235,6 +236,20 @@ fn build_emulation_option(
         .build())
 }
 
+fn apply_request_emulation(
+    req: wreq::RequestBuilder,
+    option: BrowserEmulation,
+    header_order: Option<&OrigHeaderMap>,
+) -> wreq::RequestBuilder {
+    let mut emulation = option.into_emulation();
+    if let Some(header_order) = header_order {
+        let mut merged_order = header_order.clone();
+        merged_order.extend(emulation.orig_headers);
+        emulation.orig_headers = merged_order;
+    }
+    req.emulation(emulation)
+}
+
 // --------------------------------------------------------------------------
 // Ruby Client
 // --------------------------------------------------------------------------
@@ -242,6 +257,7 @@ fn build_emulation_option(
 #[magnus::wrap(class = "Wreq::Client", free_immediately)]
 struct Client {
     inner: wreq::Client,
+    header_order: Option<OrigHeaderMap>,
     cancel_token: std::sync::Mutex<CancellationToken>,
 }
 
@@ -256,12 +272,14 @@ impl Client {
 
         let mut builder = wreq::Client::builder()
             .retry(wreq::retry::Policy::never());
+        let mut header_order = None;
 
         if let Some(opts) = opts {
             // Apply header_order BEFORE emulation so the user's ordering takes precedence
             if let Some(ary) = hash_get_array(&opts, "header_order")? {
                 let orig = array_to_orig_header_map(ary)?;
-                builder = builder.orig_headers(orig);
+                builder = builder.orig_headers(orig.clone());
+                header_order = Some(orig);
             }
 
             if let Some(val) = hash_get_value(&opts, "emulation")? {
@@ -409,7 +427,11 @@ impl Client {
         }
 
         let client = builder.build().map_err(to_magnus_error)?;
-        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()) })
+        Ok(Client {
+            inner: client,
+            header_order,
+            cancel_token: std::sync::Mutex::new(CancellationToken::new()),
+        })
     }
 
     /// client.get(url) or client.get(url, opts)
@@ -473,7 +495,7 @@ impl Client {
         let mut req = self.inner.request(method, &url);
 
         if let Some(opts) = opts {
-            req = apply_request_options(req, &opts)?;
+            req = apply_request_options(req, &opts, self.header_order.as_ref())?;
         }
 
         let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -601,10 +623,10 @@ impl Client {
 
         let mut req = self.inner.request(method, &url);
         if let Some(shared) = shared {
-            req = apply_request_options(req, shared)?;
+            req = apply_request_options(req, shared, self.header_order.as_ref())?;
         }
         if let Some(item_opts) = item_opts {
-            req = apply_request_options(req, &item_opts)?;
+            req = apply_request_options(req, &item_opts, self.header_order.as_ref())?;
         }
         Ok(req)
     }
@@ -621,6 +643,7 @@ fn value_to_method(val: Value) -> Result<wreq::Method, magnus::Error> {
 fn apply_request_options(
     mut req: wreq::RequestBuilder,
     opts: &RHash,
+    header_order: Option<&OrigHeaderMap>,
 ) -> Result<wreq::RequestBuilder, magnus::Error> {
     if let Some(val) = hash_get_value(opts, "emulation")? {
         let ruby = unsafe { Ruby::get_unchecked() };
@@ -628,12 +651,12 @@ fn apply_request_options(
             // emulation: false — no per-request emulation override
         } else if val.is_kind_of(ruby.class_true_class()) {
             let opt = build_emulation_option(DEFAULT_EMULATION, opts)?;
-            req = req.emulation(opt);
+            req = apply_request_emulation(req, opt, header_order);
         } else {
             let name: String = TryConvert::try_convert(val)?;
             let emu = parse_emulation(&name)?;
             let opt = build_emulation_option(emu, opts)?;
-            req = req.emulation(opt);
+            req = apply_request_emulation(req, opt, header_order);
         }
     }
 
