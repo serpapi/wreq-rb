@@ -47,7 +47,7 @@ fn runtime() -> &'static Runtime {
 /// # Safety
 /// The closure must NOT access any Ruby objects or call any Ruby C API.
 /// Extract all data from Ruby before calling this, convert results after.
-unsafe fn without_gvl<F, R>(f: F) -> R
+unsafe fn without_gvl<F, R>(f: F) -> Result<R, magnus::Error>
 where
     F: FnOnce(CancellationToken) -> R,
 {
@@ -89,19 +89,22 @@ where
     let data_ptr = &mut data as *mut CallData<F, R> as *mut c_void;
 
     unsafe {
-        rb_sys::rb_thread_call_without_gvl(
-            Some(call::<F, R>),
-            data_ptr,
-            Some(ubf::<F, R>),
-            data_ptr,
-        );
+        magnus::rb_sys::protect(|| {
+            rb_sys::rb_thread_call_without_gvl(
+                Some(call::<F, R>),
+                data_ptr,
+                Some(ubf::<F, R>),
+                data_ptr,
+            );
+            0
+        })?;
     }
 
     if let Some(payload) = data.panic_payload {
         panic::resume_unwind(payload);
     }
 
-    data.result.unwrap()
+    Ok(data.result.unwrap())
 }
 
 /// Collected response data as pure Rust types (no Ruby objects).
@@ -489,7 +492,7 @@ impl Client {
                     }
                 })
             })
-        };
+        }?;
 
         let data = match outcome {
             RequestOutcome::Ok(d) => d,
@@ -545,7 +548,7 @@ impl Client {
                     }
                 })
             })
-        };
+        }?;
 
         let items = match outcome {
             BatchOutcome::Done(items) => items,
@@ -876,4 +879,90 @@ pub fn init(_ruby: &magnus::Ruby, module: &magnus::RModule) -> Result<(), magnus
     module.define_module_function("head", function!(wreq_head, -1))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static READY: AtomicBool = AtomicBool::new(false);
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    struct DropProbe;
+
+    impl DropProbe {
+        fn new() -> Self {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn probe_ready() -> bool {
+        READY.load(Ordering::SeqCst)
+    }
+
+    fn drop_probe() -> Result<(), magnus::Error> {
+        let _caller_resource = DropProbe::new();
+        let result = unsafe {
+            without_gvl(|token| {
+                let _callback_resource = DropProbe::new();
+                READY.store(true, Ordering::SeqCst);
+                runtime().block_on(token.cancelled());
+                DropProbe::new()
+            })
+        }?;
+        drop(result);
+        Ok(())
+    }
+
+    #[test]
+    fn ruby_interrupts_drop_native_resources() {
+        let ruby = unsafe { magnus::embed::init() };
+        let result = unsafe { without_gvl(|_| DropProbe::new()) }.unwrap();
+        assert_eq!(LIVE.load(Ordering::SeqCst), 1);
+        drop(result);
+        assert_eq!(LIVE.load(Ordering::SeqCst), 0);
+
+        let panicked = panic::catch_unwind(|| unsafe {
+            without_gvl::<_, ()>(|_| {
+                let _resource = DropProbe::new();
+                panic!("probe panic");
+            })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(LIVE.load(Ordering::SeqCst), 0);
+
+        ruby.define_global_function("wreq_drop_probe", function!(drop_probe, 0));
+        ruby.define_global_function("wreq_probe_ready", function!(probe_ready, 0));
+
+        for (interrupt, expected) in [
+            ("worker.kill", None),
+            ("worker.raise(RuntimeError, 'stop request')", Some("stop request")),
+        ] {
+            READY.store(false, Ordering::SeqCst);
+            let result: Option<String> = ruby.eval(&format!(
+                "worker = Thread.new do
+                   begin
+                     wreq_drop_probe
+                     'returned normally'
+                   rescue RuntimeError => error
+                     error.message
+                   end
+                 end
+                 Thread.pass until wreq_probe_ready
+                 {interrupt}
+                 worker.value"
+            )).unwrap();
+
+            assert_eq!(result.as_deref(), expected);
+            assert_eq!(LIVE.load(Ordering::SeqCst), 0, "resources leaked after {interrupt}");
+        }
+    }
 }
