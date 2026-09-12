@@ -1,8 +1,22 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "objspace"
+require "socket"
 
 class ResponseTest < Minitest::Test
+  def test_native_body_is_reported_to_object_space
+    with_large_response do |response, body_size, _increase|
+      assert_operator ObjectSpace.memsize_of(response), :>=, body_size
+    end
+  end
+
+  def test_native_body_counts_toward_gc_threshold
+    with_large_response do |_response, body_size, increase|
+      assert_operator increase, :>=, body_size
+    end
+  end
+
   def test_response_methods
     resp = Wreq.get("https://httpbun.com/get")
     assert_kind_of Integer, resp.status
@@ -62,5 +76,32 @@ class ResponseTest < Minitest::Test
     assert_kind_of Array, cookies, "set-cookie should be an Array"
     assert cookies.length >= 2,
       "expected at least 2 set-cookie values, got #{cookies.length}: #{cookies.inspect}"
+  end
+
+  private
+
+  def with_large_response
+    body = "a" * (4 * 1024 * 1024)
+    server = TCPServer.new("127.0.0.1", 0)
+    server_thread = Thread.new do
+      connection = server.accept
+      connection.gets("\r\n\r\n")
+      connection.write("HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n")
+      connection.write(body)
+    ensure
+      connection&.close
+    end
+    client = Wreq::Client.new(emulation: false, http1_only: true, no_proxy: true, timeout: 5)
+    was_disabled = GC.disable
+    before = GC.stat(:malloc_increase_bytes)
+    response = client.get("http://127.0.0.1:#{server.addr[1]}/")
+    increase = GC.stat(:malloc_increase_bytes) - before
+    server_thread.value
+    yield response, body.bytesize, increase
+  ensure
+    GC.enable unless was_disabled
+    server&.close
+    server_thread&.kill
+    server_thread&.join
   end
 end

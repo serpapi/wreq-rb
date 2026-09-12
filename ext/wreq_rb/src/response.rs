@@ -5,7 +5,8 @@ use magnus::{
 use crate::error::generic_error;
 
 /// Wraps a wreq::Response in a Ruby-accessible type.
-#[magnus::wrap(class = "Wreq::Response", free_immediately)]
+#[derive(magnus::TypedData)]
+#[magnus(class = "Wreq::Response", free_immediately, size)]
 pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -26,7 +27,7 @@ impl Response {
         content_length: Option<u64>,
         transfer_size: Option<u64>,
     ) -> Self {
-        Self {
+        let response = Self {
             status,
             headers,
             body,
@@ -34,7 +35,18 @@ impl Response {
             version,
             content_length,
             transfer_size,
-        }
+        };
+        unsafe { Ruby::get_unchecked() }
+            .gc_adjust_memory_usage(response.heap_size() as isize);
+        response
+    }
+
+    fn heap_size(&self) -> usize {
+        self.body.capacity()
+            + self.url.capacity()
+            + self.version.capacity()
+            + self.headers.capacity() * std::mem::size_of::<(String, String)>()
+            + self.headers.iter().map(|(name, value)| name.capacity() + value.capacity()).sum::<usize>()
     }
 
     fn status(&self) -> u16 {
@@ -116,6 +128,19 @@ impl Response {
 
     fn to_s(&self) -> Result<String, magnus::Error> {
         self.text()
+    }
+}
+
+impl magnus::DataTypeFunctions for Response {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_size()
+    }
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        unsafe { Ruby::get_unchecked() }
+            .gc_adjust_memory_usage(-(self.heap_size() as isize));
     }
 }
 
