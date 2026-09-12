@@ -291,12 +291,13 @@ impl Client {
                 builder = builder.default_headers(hmap);
             }
 
-            if let Some(t) = hash_get_float(&opts, "timeout")? {
-                builder = builder.timeout(Duration::from_secs_f64(t));
+            let timeout = hash_get_float(&opts, "timeout")?;
+            if let Some(timeout) = timeout {
+                builder = builder.timeout(Duration::from_secs_f64(timeout));
             }
 
-            if let Some(t) = hash_get_float(&opts, "connect_timeout")? {
-                builder = builder.connect_timeout(Duration::from_secs_f64(t));
+            if let Some(connect_timeout) = hash_get_float(&opts, "connect_timeout")?.or(timeout) {
+                builder = builder.connect_timeout(Duration::from_secs_f64(connect_timeout));
             }
 
             if let Some(t) = hash_get_float(&opts, "read_timeout")? {
