@@ -20,6 +20,14 @@ Minitest::TestTask.create(:test) do |t|
   t.test_globs = ["test/**/*_test.rb"]
 end
 
+namespace :test do
+  desc "Run native extension tests"
+  task :native do
+    sh "cargo test -p wreq_rb --lib"
+  end
+end
+task test: "test:native"
+
 # Reset vendored submodules to clean state on rake clean
 task :reset_submodules do
   puts "Resetting vendored submodules..."
