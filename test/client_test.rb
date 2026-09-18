@@ -109,7 +109,93 @@ class ClientTest < Minitest::Test
     assert_operator elapsed, :>=, 0.4
   end
 
+  def test_resolve_overrides_dns_for_a_domain
+    host = with_local_http_server do |port|
+      client = resolving_client("wreq-resolve.invalid" => "127.0.0.1")
+      assert_equal 200, client.get("http://wreq-resolve.invalid:#{port}/").status
+    end
+    assert_match(/\Awreq-resolve\.invalid:/, host)
+  end
+
+  def test_resolve_honours_the_port_in_the_override
+    # The URL carries no explicit port, so the port from the override is used
+    # instead of the scheme default (80).
+    host = with_local_http_server do |port|
+      client = resolving_client("wreq-resolve.invalid" => "127.0.0.1:#{port}")
+      assert_equal 200, client.get("http://wreq-resolve.invalid/").status
+    end
+    assert_equal "wreq-resolve.invalid", host
+  end
+
+  def test_resolve_accepts_multiple_addresses
+    dead_port = free_port
+    host = with_local_http_server do |port|
+      # The first address refuses connections, so wreq falls through to the second.
+      client = resolving_client(
+        "wreq-resolve.invalid" => ["127.0.0.1:#{dead_port}", "127.0.0.1:#{port}"]
+      )
+      assert_equal 200, client.get("http://wreq-resolve.invalid/", timeout: 10).status
+    end
+    assert_equal "wreq-resolve.invalid", host
+  end
+
+  def test_resolve_leaves_other_domains_alone
+    client = resolving_client("wreq-resolve.invalid" => "127.0.0.1")
+    assert_equal 200, client.get("https://httpbun.com/get").status
+  end
+
+  def test_resolve_rejects_an_invalid_address
+    error = assert_raises(Wreq::Error) do
+      Wreq::Client.new(resolve: { "example.com" => "not-an-ip" })
+    end
+    assert_match(/invalid resolve address/, error.message)
+  end
+
   private
+
+  def resolving_client(overrides)
+    Wreq::Client.new(
+      emulation: false,
+      http1_only: true,
+      no_proxy: true,
+      resolve: overrides
+    )
+  end
+
+  def free_port
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    server.close
+    port
+  end
+
+  # Spins up a local HTTP/1.1 server, yields its port, and returns the Host
+  # header of the request it received.
+  def with_local_http_server
+    require "socket"
+    server = TCPServer.new("127.0.0.1", 0)
+    host = nil
+    t = Thread.new do
+      conn = server.accept
+      conn.gets # skip request line
+      loop do
+        line = conn.gets&.chomp
+        break if line.nil? || line.empty?
+        name, value = line.split(":", 2)
+        host = value.strip if name.downcase == "host"
+      end
+      conn.write "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+      conn.close
+    rescue
+      conn&.close
+    end
+    yield server.addr[1]
+    t.join(5)
+    host
+  ensure
+    t&.kill
+    server&.close
+  end
 
   def stalled_tls_request_duration(options, request_timeout: 3)
     require "socket"

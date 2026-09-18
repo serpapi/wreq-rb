@@ -91,6 +91,10 @@ client = Wreq::Client.new(
   tcp_nodelay: true,           # disable Nagle algorithm (default: true)
   tcp_keepalive: 15,           # SO_KEEPALIVE interval in seconds (default: 15)
   local_address: "1.2.3.4",    # bind outgoing connections to this source IP
+  resolve: {                   # override DNS resolution per domain
+    "example.com" => "1.2.3.4",
+    "api.example.com" => ["1.2.3.4:8443", "[::1]:8443"],
+  },
   tls_sni: true,               # send SNI in TLS handshake (default: true)
   min_tls_version: "tls1.2",   # minimum TLS version: tls1.0, tls1.1, tls1.2, tls1.3
   max_tls_version: "tls1.3",   # maximum TLS version
@@ -99,6 +103,36 @@ client = Wreq::Client.new(
 resp = client.get("https://api.example.com/data")
 resp = client.post("https://api.example.com/data", json: { key: "value" })
 ```
+
+## Overriding DNS
+
+Pass `resolve` to point specific domains at IP addresses of your choice,
+bypassing DNS for them (the equivalent of curl's `--resolve`). Useful for
+hitting a staging host by IP while keeping the real `Host` header and TLS SNI,
+or for pinning a domain to one node of a load balancer.
+
+```ruby
+client = Wreq::Client.new(
+  resolve: {
+    "example.com" => "127.0.0.1",                       # one address
+    "api.example.com" => ["10.0.0.1", "10.0.0.2"],      # tried in order
+  }
+)
+
+resp = client.get("https://example.com/")  # connects to 127.0.0.1:443
+```
+
+Addresses are IPv4 or IPv6, with an optional port:
+
+| Value | Connects to |
+|-------|-------------|
+| `"1.2.3.4"` | `1.2.3.4` on the URL's port, or the scheme default |
+| `"1.2.3.4:8443"` | `1.2.3.4:8443` |
+| `"::1"` / `"[::1]"` | `[::1]` on the URL's port, or the scheme default |
+| `"[::1]:8443"` | `[::1]:8443` |
+
+An explicit port in the request URL always wins over a port in the override.
+Domains without an entry resolve normally.
 
 ## HTTP Methods
 

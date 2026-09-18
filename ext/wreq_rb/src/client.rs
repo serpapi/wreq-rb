@@ -13,7 +13,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::tls::TlsVersion;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
@@ -391,6 +391,12 @@ impl Client {
                 let addr: IpAddr = addr_str.parse()
                     .map_err(|_| generic_error(format!("invalid IP address: '{}'", addr_str)))?;
                 builder = builder.local_address(addr);
+            }
+
+            if let Some(resolve_hash) = hash_get_hash(&opts, "resolve")? {
+                for (domain, addrs) in hash_to_dns_overrides(&resolve_hash)? {
+                    builder = builder.resolve_to_addrs(domain, addrs);
+                }
             }
 
             if let Some(v) = hash_get_bool(&opts, "tls_sni")? {
@@ -836,6 +842,56 @@ fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
         Ok(magnus::r_hash::ForEach::Continue)
     })?;
     Ok(hmap)
+}
+
+/// Parse a DNS override target into a SocketAddr. Accepts a bare IP
+/// ("1.2.3.4", "::1", "[::1]") or an IP with a port ("1.2.3.4:8080",
+/// "[::1]:8080"). A missing port is stored as 0, which makes wreq fall back to
+/// the port in the request URL (or the scheme's default port).
+fn parse_socket_addr(s: &str) -> Result<SocketAddr, magnus::Error> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let bare = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => Ok(SocketAddr::new(ip, 0)),
+        Err(_) => Err(generic_error(format!(
+            "invalid resolve address: '{}'. Use an IP ('1.2.3.4', '::1') \
+             or an IP with a port ('1.2.3.4:8080', '[::1]:8080')", s
+        ))),
+    }
+}
+
+/// Convert a `resolve:` hash of domain => address(es) into DNS overrides. Each
+/// value is a single address string or an array of them.
+fn hash_to_dns_overrides(hash: &RHash) -> Result<Vec<(String, Vec<SocketAddr>)>, magnus::Error> {
+    let mut overrides: Vec<(String, Vec<SocketAddr>)> = Vec::new();
+    hash.foreach(|k: Value, v: Value| {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let domain: String = if k.is_kind_of(ruby.class_symbol()) {
+            k.funcall("to_s", ())?
+        } else {
+            TryConvert::try_convert(k)?
+        };
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        if v.is_kind_of(ruby.class_array()) {
+            for elem in RArray::try_convert(v)?.into_iter() {
+                let addr_str: String = TryConvert::try_convert(elem)?;
+                addrs.push(parse_socket_addr(&addr_str)?);
+            }
+        } else {
+            let addr_str: String = TryConvert::try_convert(v)?;
+            addrs.push(parse_socket_addr(&addr_str)?);
+        }
+        if addrs.is_empty() {
+            return Err(generic_error(format!(
+                "resolve entry for '{}' has no addresses", domain
+            )));
+        }
+        overrides.push((domain, addrs));
+        Ok(magnus::r_hash::ForEach::Continue)
+    })?;
+    Ok(overrides)
 }
 
 fn hash_to_pairs(hash: &RHash) -> Result<Vec<(String, String)>, magnus::Error> {
