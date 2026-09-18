@@ -848,6 +848,9 @@ fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
 /// ("1.2.3.4", "::1", "[::1]") or an IP with a port ("1.2.3.4:8080",
 /// "[::1]:8080"). A missing port is stored as 0, which makes wreq fall back to
 /// the port in the request URL (or the scheme's default port).
+///
+/// An IPv6 address with a port must be bracketed: "::1:8080" is a valid IPv6
+/// address in its own right and parses as one, not as "::1" on port 8080.
 fn parse_socket_addr(s: &str) -> Result<SocketAddr, magnus::Error> {
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(addr);

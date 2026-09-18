@@ -131,6 +131,10 @@ Addresses are IPv4 or IPv6, with an optional port:
 | `"::1"` / `"[::1]"` | `[::1]` on the URL's port, or the scheme default |
 | `"[::1]:8443"` | `[::1]:8443` |
 
+An IPv6 address with a port **must** be bracketed: `"::1:8080"` is itself a
+valid IPv6 address, so it is parsed as one (with no port) rather than as `::1`
+on port 8080.
+
 An explicit port in the request URL always wins over a port in the override.
 Domains without an entry resolve normally.
 
