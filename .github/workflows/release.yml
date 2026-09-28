@@ -62,8 +62,16 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: "2.7,3.0,3.1,3.2,3.3,3.4"
-          cache-version: v4
-          pre-script: rustup update stable && rustup target add "$RUST_TARGET"
+          cache-version: v5
+          # btls-sys prefixes BoringSSL symbols with a bare `objcopy`, and the image's
+          # x86_64 one exits cleanly without touching aarch64 archives.
+          pre-script: >-
+            rustup update stable && rustup target add "$RUST_TARGET" &&
+            if [ "$RUST_TARGET" = aarch64-unknown-linux-gnu ]; then
+            mkdir -p /tmp/xbin &&
+            ln -sf /usr/bin/aarch64-linux-gnu-objcopy /tmp/xbin/objcopy &&
+            ln -sf /usr/bin/aarch64-linux-gnu-nm /tmp/xbin/nm &&
+            export PATH="/tmp/xbin:$PATH"; fi
 
       - uses: actions/upload-artifact@v6
         with:
@@ -102,12 +110,13 @@ jobs:
         run: ruby -Itest -e 'Dir.glob("test/**/*_test.rb").each { |f| require File.expand_path(f) }'
 
   test-cross-gem:
-    name: Test cross gem / Ruby ${{ matrix.ruby }}
+    name: Test cross gem / ${{ matrix.platform }} / Ruby ${{ matrix.ruby }}
     needs: [cross-gem]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform == 'aarch64-linux' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
+        platform: [x86_64-linux, aarch64-linux]
         ruby: ["2.7", "3.0", "3.4"]
     steps:
       - uses: actions/checkout@v6
@@ -121,7 +130,7 @@ jobs:
 
       - uses: actions/download-artifact@v6
         with:
-          name: cross-gem-x86_64-linux
+          name: cross-gem-${{ matrix.platform }}
           path: gems
 
       - name: Install gem
