@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use magnus::{
@@ -15,7 +16,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::http2::{StreamDependency, StreamId};
 use wreq::tls::TlsVersion;
+use wreq::IntoEmulation;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
 
 use crate::error::{generic_error, to_magnus_error, wreq_error};
@@ -220,19 +223,125 @@ fn parse_emulation_os(name: &str) -> Result<EmulationPlatform, magnus::Error> {
         .map_err(|_| generic_error("unknown emulation_os. Use: 'windows', 'macos', 'linux', 'android', 'ios'"))
 }
 
-/// Build a BrowserEmulation from a profile and an optional platform from the opts hash.
-fn build_emulation_option(
-    profile: BrowserProfile,
-    opts: &RHash,
-) -> Result<BrowserEmulation, magnus::Error> {
+fn is_chrome_profile(profile: BrowserProfile) -> bool {
+    serde_json::to_value(profile).ok().and_then(|name| name.as_str().map(|name| name.starts_with("chrome_"))).unwrap_or(false)
+}
+
+fn chrome_weight(urgency: u8) -> u16 {
+    ((255.9 / 7.0) * f64::from(7 - urgency.min(7))).floor() as u16 + 1
+}
+
+fn parse_priority_urgency(value: &str) -> u8 {
+    value.split(',').find_map(|part| part.trim().strip_prefix("u=")?.trim().parse::<u8>().ok()).filter(|urgency| *urgency <= 7).unwrap_or(3)
+}
+
+fn dest_urgency(dest: &str) -> Option<u8> {
+    match dest {
+        "document" | "style" | "font" => Some(0),
+        "empty" => Some(1),
+        "image" | "script" => Some(2),
+        _ => None,
+    }
+}
+
+fn urgency_from_headers(caller_priority: Option<&str>, caller_dest: Option<&str>, default_priority: Option<&str>, default_dest: Option<&str>) -> u8 {
+    if let Some(priority) = caller_priority { return parse_priority_urgency(priority); }
+    if let Some(urgency) = caller_dest.and_then(dest_urgency) { return urgency; }
+    if let Some(priority) = default_priority { return parse_priority_urgency(priority); }
+    if let Some(urgency) = default_dest.and_then(dest_urgency) { return urgency; }
+    0
+}
+
+fn chrome_header_defaults(emulation: &wreq::Emulation) -> (Option<String>, Option<String>) {
+    let get = |name| emulation.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    (get("priority"), get("sec-fetch-dest"))
+}
+
+fn request_header(opts: &RHash, header_name: &str) -> Result<Option<String>, magnus::Error> {
+    let Some(headers) = hash_get_hash(opts, "headers")? else { return Ok(None); };
+    let mut found = None;
+    headers.foreach(|k: Value, v: Value| {
+        if v.is_nil() || found.is_some() { return Ok(magnus::r_hash::ForEach::Continue); }
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let key: String = if k.is_kind_of(ruby.class_symbol()) { k.funcall("to_s", ())? } else { TryConvert::try_convert(k)? };
+        if key.eq_ignore_ascii_case(header_name) { found = Some(v.funcall("to_s", ())?); }
+        Ok(magnus::r_hash::ForEach::Continue)
+    })?;
+    Ok(found)
+}
+
+fn merged_request_header(first: Option<&RHash>, second: Option<&RHash>, name: &str) -> Result<Option<String>, magnus::Error> {
+    if let Some(second) = second { if let Some(value) = request_header(second, name)? { return Ok(Some(value)); } }
+    if let Some(first) = first { if let Some(value) = request_header(first, name)? { return Ok(Some(value)); } }
+    Ok(None)
+}
+
+fn build_emulation_option(profile: BrowserProfile, opts: &RHash, chrome_weight: Option<u16>) -> Result<wreq::Emulation, magnus::Error> {
     let platform = match hash_get_string(opts, "emulation_os")? {
         Some(platform_name) => parse_emulation_os(&platform_name)?,
         None => EmulationPlatform::default(),
     };
-    Ok(BrowserEmulation::builder()
-        .profile(profile)
-        .platform(platform)
-        .build())
+    Ok(browser_emulation(profile, platform, chrome_weight))
+}
+
+fn browser_emulation(profile: BrowserProfile, platform: EmulationPlatform, weight: Option<u16>) -> wreq::Emulation {
+    let mut emulation = BrowserEmulation::builder().profile(profile).platform(platform).build().into_emulation();
+    if is_chrome_profile(profile) {
+        if let (Some(http2), Some(weight)) = (emulation.http2_options.as_mut(), weight) {
+            http2.headers_stream_dependency = Some(StreamDependency::new(StreamId::zero(), (weight - 1) as u8, true));
+        }
+    }
+    emulation
+}
+
+#[derive(Clone)]
+struct ChromeClientConfig {
+    profile: BrowserProfile,
+    platform: EmulationPlatform,
+    header_order: Option<OrigHeaderMap>,
+    headers: Option<HeaderMap>,
+    user_agent: Option<String>,
+    cookie_store: Option<Arc<dyn wreq::cookie::CookieStore>>,
+    verify_host: Option<bool>,
+    verify_cert: Option<bool>,
+    http2_only: bool,
+    http1_only: bool,
+    timeout: Option<f64>,
+    connect_timeout: Option<f64>,
+    read_timeout: Option<f64>,
+}
+
+impl Default for ChromeClientConfig {
+    fn default() -> Self {
+        Self { profile: DEFAULT_EMULATION, platform: EmulationPlatform::default(), header_order: None, headers: None, user_agent: None, cookie_store: None, verify_host: None, verify_cert: None, http2_only: false, http1_only: false, timeout: None, connect_timeout: None, read_timeout: None }
+    }
+}
+
+impl ChromeClientConfig {
+    fn build(&self, weight: u16) -> Result<wreq::Client, magnus::Error> {
+        let mut builder = wreq::Client::builder().retry(wreq::retry::Policy::never());
+        if let Some(orig) = self.header_order.clone() { builder = builder.orig_headers(orig); }
+        builder = builder.emulation(browser_emulation(self.profile, self.platform, Some(weight)));
+        if let Some(ua) = self.user_agent.clone() { builder = builder.user_agent(ua); }
+        if let Some(headers) = self.headers.clone() { builder = builder.default_headers(headers); }
+        if let Some(cookie_store) = self.cookie_store.clone() { builder = builder.cookie_provider(cookie_store); }
+        if let Some(v) = self.verify_host { builder = builder.tls_verify_hostname(v); }
+        if let Some(v) = self.verify_cert { builder = builder.tls_cert_verification(v); }
+        if self.http1_only { builder = builder.http1_only(); }
+        if self.http2_only { builder = builder.http2_only(); }
+        if let Some(t) = self.timeout { builder = builder.timeout(Duration::from_secs_f64(t)); }
+        if let Some(t) = self.connect_timeout.or(self.timeout) { builder = builder.connect_timeout(Duration::from_secs_f64(t)); }
+        if let Some(t) = self.read_timeout { builder = builder.read_timeout(Duration::from_secs_f64(t)); }
+        builder.build().map_err(to_magnus_error)
+    }
+}
+
+struct ChromeState {
+    config: ChromeClientConfig,
+    priority: Option<String>,
+    dest: Option<String>,
+    default_weight: u16,
+    clients: Mutex<HashMap<u16, wreq::Client>>,
 }
 
 // --------------------------------------------------------------------------
@@ -242,7 +351,8 @@ fn build_emulation_option(
 #[magnus::wrap(class = "Wreq::Client", free_immediately)]
 struct Client {
     inner: wreq::Client,
-    cancel_token: std::sync::Mutex<CancellationToken>,
+    chrome: Option<ChromeState>,
+    cancel_token: Mutex<CancellationToken>,
 }
 
 impl Client {
@@ -256,51 +366,79 @@ impl Client {
 
         let mut builder = wreq::Client::builder()
             .retry(wreq::retry::Policy::never());
+        let mut chrome_config: Option<ChromeClientConfig> = None;
+        let mut chrome_priority = None;
+        let mut chrome_dest = None;
+        let mut default_weight = None;
 
         if let Some(opts) = opts {
             // Apply header_order BEFORE emulation so the user's ordering takes precedence
             if let Some(ary) = hash_get_array(&opts, "header_order")? {
                 let orig = array_to_orig_header_map(ary)?;
+                chrome_config.get_or_insert_with(|| ChromeClientConfig::default()).header_order = Some(orig.clone());
                 builder = builder.orig_headers(orig);
             }
 
-            if let Some(val) = hash_get_value(&opts, "emulation")? {
+            let profile = if let Some(val) = hash_get_value(&opts, "emulation")? {
                 let ruby = unsafe { Ruby::get_unchecked() };
                 if val.is_kind_of(ruby.class_false_class()) {
-                    // emulation: false — skip emulation entirely
+                    None
                 } else if val.is_kind_of(ruby.class_true_class()) {
-                    let opt = build_emulation_option(DEFAULT_EMULATION, &opts)?;
-                    builder = builder.emulation(opt);
+                    Some(DEFAULT_EMULATION)
                 } else {
                     let name: String = TryConvert::try_convert(val)?;
-                    let emu = parse_emulation(&name)?;
-                    let opt = build_emulation_option(emu, &opts)?;
-                    builder = builder.emulation(opt);
+                    Some(parse_emulation(&name)?)
                 }
             } else {
-                let opt = build_emulation_option(DEFAULT_EMULATION, &opts)?;
-                builder = builder.emulation(opt);
+                Some(DEFAULT_EMULATION)
+            };
+            if let Some(profile) = profile {
+                let platform = match hash_get_string(&opts, "emulation_os")? {
+                    Some(platform_name) => parse_emulation_os(&platform_name)?,
+                    None => EmulationPlatform::default(),
+                };
+                let emulation = browser_emulation(profile, platform, None);
+                if is_chrome_profile(profile) {
+                    (chrome_priority, chrome_dest) = chrome_header_defaults(&emulation);
+                    if let Some(value) = request_header(&opts, "priority")? { chrome_priority = Some(value); }
+                    if let Some(value) = request_header(&opts, "sec-fetch-dest")? { chrome_dest = Some(value); }
+                    let weight = chrome_weight(urgency_from_headers(None, None, chrome_priority.as_deref(), chrome_dest.as_deref()));
+                    default_weight = Some(weight);
+                    chrome_config.get_or_insert_with(|| ChromeClientConfig::default()).profile = profile;
+                    chrome_config.as_mut().unwrap().platform = platform;
+                    builder = builder.emulation(browser_emulation(profile, platform, Some(weight)));
+                } else {
+                    chrome_config = None;
+                    builder = builder.emulation(emulation);
+                }
+            } else {
+                chrome_config = None;
             }
 
             if let Some(ua) = hash_get_string(&opts, "user_agent")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.user_agent = Some(ua.clone()); }
                 builder = builder.user_agent(ua);
             }
 
             if let Some(hdr_hash) = hash_get_hash(&opts, "headers")? {
                 let hmap = hash_to_header_map(&hdr_hash)?;
+                if let Some(cfg) = chrome_config.as_mut() { cfg.headers = Some(hmap.clone()); }
                 builder = builder.default_headers(hmap);
             }
 
             let timeout = hash_get_float(&opts, "timeout")?;
             if let Some(timeout) = timeout {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.timeout = Some(timeout); }
                 builder = builder.timeout(Duration::from_secs_f64(timeout));
             }
 
             if let Some(connect_timeout) = hash_get_float(&opts, "connect_timeout")?.or(timeout) {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.connect_timeout = Some(connect_timeout); }
                 builder = builder.connect_timeout(Duration::from_secs_f64(connect_timeout));
             }
 
             if let Some(t) = hash_get_float(&opts, "read_timeout")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.read_timeout = Some(t); }
                 builder = builder.read_timeout(Duration::from_secs_f64(t));
             }
 
@@ -317,7 +455,13 @@ impl Client {
             }
 
             if let Some(enabled) = hash_get_bool(&opts, "cookie_store")? {
-                builder = builder.cookie_store(enabled);
+                if enabled {
+                    let jar = Arc::new(wreq::cookie::Jar::default());
+                    if let Some(cfg) = chrome_config.as_mut() { cfg.cookie_store = Some(jar.clone()); }
+                    builder = builder.cookie_provider(jar);
+                } else {
+                    builder = builder.cookie_store(false);
+                }
             }
 
             if let Some(proxy_url) = hash_get_string(&opts, "proxy")? {
@@ -340,17 +484,21 @@ impl Client {
             }
 
             if let Some(v) = hash_get_bool(&opts, "verify_host")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.verify_host = Some(v); }
                 builder = builder.tls_verify_hostname(v);
             }
 
             if let Some(v) = hash_get_bool(&opts, "verify_cert")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.verify_cert = Some(v); }
                 builder = builder.tls_cert_verification(v);
             }
 
             if let Some(true) = hash_get_bool(&opts, "http1_only")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.http1_only = true; }
                 builder = builder.http1_only();
             }
             if let Some(true) = hash_get_bool(&opts, "http2_only")? {
+                if let Some(cfg) = chrome_config.as_mut() { cfg.http2_only = true; }
                 builder = builder.http2_only();
             }
 
@@ -405,11 +553,23 @@ impl Client {
                 builder = builder.tls_max_version(parse_tls_version(&s)?);
             }
         } else {
-            builder = builder.emulation(DEFAULT_EMULATION);
+            let emulation = browser_emulation(DEFAULT_EMULATION, EmulationPlatform::default(), None);
+            (chrome_priority, chrome_dest) = chrome_header_defaults(&emulation);
+            let weight = chrome_weight(urgency_from_headers(None, None, chrome_priority.as_deref(), chrome_dest.as_deref()));
+            default_weight = Some(weight);
+            chrome_config = Some(ChromeClientConfig { profile: DEFAULT_EMULATION, platform: EmulationPlatform::default(), ..Default::default() });
+            builder = builder.emulation(browser_emulation(DEFAULT_EMULATION, EmulationPlatform::default(), Some(weight)));
         }
 
+        let chrome = chrome_config.map(|config| ChromeState {
+            config,
+            priority: chrome_priority,
+            dest: chrome_dest,
+            default_weight: default_weight.unwrap_or_else(|| chrome_weight(0)),
+            clients: Mutex::new(HashMap::new()),
+        });
         let client = builder.build().map_err(to_magnus_error)?;
-        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()) })
+        Ok(Client { inner: client, chrome, cancel_token: Mutex::new(CancellationToken::new()) })
     }
 
     /// client.get(url) or client.get(url, opts)
@@ -453,6 +613,58 @@ impl Client {
         old_token.cancel();
     }
 
+    fn chrome_request_weight(
+        &self,
+        first: Option<&RHash>,
+        second: Option<&RHash>,
+    ) -> Result<Option<u16>, magnus::Error> {
+        let Some(chrome) = self.chrome.as_ref() else { return Ok(None); };
+        for opts in [second, first].into_iter().flatten() {
+            if let Some(val) = hash_get_value(opts, "emulation")? {
+                let ruby = unsafe { Ruby::get_unchecked() };
+                if val.is_kind_of(ruby.class_false_class()) {
+                    return Ok(None);
+                }
+                if !val.is_kind_of(ruby.class_true_class()) {
+                    let name: String = TryConvert::try_convert(val)?;
+                    if !is_chrome_profile(parse_emulation(&name)?) {
+                        return Ok(None);
+                    }
+                }
+                break;
+            }
+        }
+        let priority = merged_request_header(first, second, "priority")?;
+        let dest = merged_request_header(first, second, "sec-fetch-dest")?;
+        Ok(Some(chrome_weight(urgency_from_headers(
+            priority.as_deref(),
+            dest.as_deref(),
+            chrome.priority.as_deref(),
+            chrome.dest.as_deref(),
+        ))))
+    }
+
+    fn request_client(
+        &self,
+        first: Option<&RHash>,
+        second: Option<&RHash>,
+    ) -> Result<wreq::Client, magnus::Error> {
+        let Some(weight) = self.chrome_request_weight(first, second)? else {
+            return Ok(self.inner.clone());
+        };
+        let Some(chrome) = self.chrome.as_ref() else { return Ok(self.inner.clone()); };
+        if weight == chrome.default_weight {
+            return Ok(self.inner.clone());
+        }
+        let mut clients = chrome.clients.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(client) = clients.get(&weight) {
+            return Ok(client.clone());
+        }
+        let client = chrome.config.build(weight)?;
+        clients.insert(weight, client.clone());
+        Ok(client)
+    }
+
     fn execute_method(&self, method_str: &str, args: &[Value]) -> Result<Response, magnus::Error> {
         let url: String = if args.is_empty() {
             return Err(generic_error("url is required"));
@@ -470,10 +682,11 @@ impl Client {
             .parse()
             .map_err(|_| generic_error(format!("invalid HTTP method: {}", method_str)))?;
 
-        let mut req = self.inner.request(method, &url);
+        let chrome_weight = self.chrome_request_weight(None, opts.as_ref())?;
+        let mut req = self.request_client(None, opts.as_ref())?.request(method, &url);
 
         if let Some(opts) = opts {
-            req = apply_request_options(req, &opts)?;
+            req = apply_request_options(req, &opts, chrome_weight)?;
         }
 
         let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -599,12 +812,13 @@ impl Client {
             url = TryConvert::try_convert(spec)?;
         }
 
-        let mut req = self.inner.request(method, &url);
+        let chrome_weight = self.chrome_request_weight(shared, item_opts.as_ref())?;
+        let mut req = self.request_client(shared, item_opts.as_ref())?.request(method, &url);
         if let Some(shared) = shared {
-            req = apply_request_options(req, shared)?;
+            req = apply_request_options(req, shared, chrome_weight)?;
         }
         if let Some(item_opts) = item_opts {
-            req = apply_request_options(req, &item_opts)?;
+            req = apply_request_options(req, &item_opts, chrome_weight)?;
         }
         Ok(req)
     }
@@ -621,18 +835,19 @@ fn value_to_method(val: Value) -> Result<wreq::Method, magnus::Error> {
 fn apply_request_options(
     mut req: wreq::RequestBuilder,
     opts: &RHash,
+    chrome_weight: Option<u16>,
 ) -> Result<wreq::RequestBuilder, magnus::Error> {
     if let Some(val) = hash_get_value(opts, "emulation")? {
         let ruby = unsafe { Ruby::get_unchecked() };
         if val.is_kind_of(ruby.class_false_class()) {
             // emulation: false — no per-request emulation override
         } else if val.is_kind_of(ruby.class_true_class()) {
-            let opt = build_emulation_option(DEFAULT_EMULATION, opts)?;
+            let opt = build_emulation_option(DEFAULT_EMULATION, opts, chrome_weight)?;
             req = req.emulation(opt);
         } else {
             let name: String = TryConvert::try_convert(val)?;
             let emu = parse_emulation(&name)?;
-            let opt = build_emulation_option(emu, opts)?;
+            let opt = build_emulation_option(emu, opts, chrome_weight)?;
             req = req.emulation(opt);
         }
     }
@@ -807,7 +1022,7 @@ fn array_to_orig_header_map(ary: RArray) -> Result<OrigHeaderMap, magnus::Error>
     for elem in ary.into_iter() {
         let ruby = unsafe { Ruby::get_unchecked() };
         let name_str: String = if elem.is_kind_of(ruby.class_symbol()) {
-            elem.funcall("to_s", ())?  
+            elem.funcall("to_s", ())?
         } else {
             TryConvert::try_convert(elem)?
         };
@@ -921,6 +1136,31 @@ mod tests {
         }?;
         drop(result);
         Ok(())
+    }
+
+    #[test]
+    fn chrome_priority_urgency_maps_to_http2_weight() {
+        assert_eq!(chrome_weight(0), 256);
+        assert_eq!(chrome_weight(1), 220);
+        assert_eq!(chrome_weight(2), 183);
+        assert_eq!(chrome_weight(3), 147);
+        assert_eq!(chrome_weight(4), 110);
+    }
+
+    #[test]
+    fn priority_header_parsing_defaults_to_rfc_urgency() {
+        assert_eq!(parse_priority_urgency("u=0, i"), 0);
+        assert_eq!(parse_priority_urgency("i, u=1"), 1);
+        assert_eq!(parse_priority_urgency("u=2"), 2);
+        assert_eq!(parse_priority_urgency("i"), 3);
+        assert_eq!(parse_priority_urgency("u=9, i"), 3);
+    }
+
+    #[test]
+    fn caller_sec_fetch_dest_precedes_profile_priority() {
+        assert_eq!(urgency_from_headers(None, Some("empty"), Some("u=0, i"), Some("document")), 1);
+        assert_eq!(urgency_from_headers(Some("u=2"), Some("empty"), Some("u=0, i"), Some("document")), 2);
+        assert_eq!(urgency_from_headers(None, None, Some("u=0, i"), Some("empty")), 0);
     }
 
     #[test]
