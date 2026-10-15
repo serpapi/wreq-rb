@@ -3,6 +3,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use magnus::{
@@ -25,15 +26,45 @@ use crate::response::Response;
 // Shared Tokio runtime
 // --------------------------------------------------------------------------
 
+// fork() copies the runtime but not its worker threads, so a child that reused it
+// would block forever or panic on the parent's I/O driver. Each process builds its
+// own; the inherited one is leaked because dropping it would join threads that
+// don't exist in the child. No lock guards this: a lock held by another thread at
+// fork time would stay locked in the child forever.
+struct ProcessRuntime {
+    pid: u32,
+    runtime: Runtime,
+}
+
 fn runtime() -> &'static Runtime {
-    use std::sync::OnceLock;
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime")
-    })
+    use std::sync::atomic::AtomicPtr;
+    static RT: AtomicPtr<ProcessRuntime> = AtomicPtr::new(ptr::null_mut());
+
+    let pid = std::process::id();
+    let mut current = RT.load(Ordering::Acquire);
+    loop {
+        // SAFETY: published pointers are never freed (see above).
+        if let Some(installed) = unsafe { current.as_ref() } {
+            if installed.pid == pid {
+                return &installed.runtime;
+            }
+        }
+        let built = Box::into_raw(Box::new(ProcessRuntime {
+            pid,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime"),
+        }));
+        match RT.compare_exchange(current, built, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return unsafe { &(*built).runtime },
+            Err(winner) => {
+                // Another thread of this process installed one first; ours never ran a task.
+                drop(unsafe { Box::from_raw(built) });
+                current = winner;
+            }
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -243,6 +274,10 @@ fn build_emulation_option(
 struct Client {
     inner: wreq::Client,
     cancel_token: std::sync::Mutex<CancellationToken>,
+    // Process that sent the first request (0 = none yet). Pooled connections
+    // belong to that process's runtime and sockets, so a forked child must not
+    // reuse them.
+    owner_pid: AtomicU32,
 }
 
 impl Client {
@@ -409,7 +444,7 @@ impl Client {
         }
 
         let client = builder.build().map_err(to_magnus_error)?;
-        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()) })
+        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()), owner_pid: AtomicU32::new(0) })
     }
 
     /// client.get(url) or client.get(url, opts)
@@ -453,7 +488,20 @@ impl Client {
         old_token.cancel();
     }
 
+    fn claim_for_current_process(&self) -> Result<(), magnus::Error> {
+        let pid = std::process::id();
+        match self.owner_pid.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(()),
+            Err(owner) if owner == pid => Ok(()),
+            Err(owner) => Err(generic_error(format!(
+                "Wreq::Client was used in process {} and cannot be reused after fork in process {}; create a new client in this process",
+                owner, pid
+            ))),
+        }
+    }
+
     fn execute_method(&self, method_str: &str, args: &[Value]) -> Result<Response, magnus::Error> {
+        self.claim_for_current_process()?;
         let url: String = if args.is_empty() {
             return Err(generic_error("url is required"));
         } else {
@@ -505,6 +553,7 @@ impl Client {
 
     /// Wreq::Client#request_batch(specs) or #request_batch(specs, options)
     fn request_batch(&self, args: &[Value]) -> Result<RArray, magnus::Error> {
+        self.claim_for_current_process()?;
         if args.is_empty() {
             return Err(generic_error("an array of requests is required"));
         }
