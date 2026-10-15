@@ -29,23 +29,40 @@ use crate::response::Response;
 // fork() copies the runtime but not its worker threads, so a child that reused it
 // would block forever or panic on the parent's I/O driver. Each process builds its
 // own; the inherited one is leaked because dropping it would join threads that
-// don't exist in the child.
+// don't exist in the child. No lock guards this: a lock held by another thread at
+// fork time would stay locked in the child forever.
+struct ProcessRuntime {
+    pid: u32,
+    runtime: Runtime,
+}
+
 fn runtime() -> &'static Runtime {
-    use std::sync::Mutex;
-    static RT: Mutex<Option<(u32, &'static Runtime)>> = Mutex::new(None);
+    use std::sync::atomic::AtomicPtr;
+    static RT: AtomicPtr<ProcessRuntime> = AtomicPtr::new(ptr::null_mut());
+
     let pid = std::process::id();
-    let mut current = RT.lock().unwrap_or_else(|e| e.into_inner());
-    match *current {
-        Some((owner, rt)) if owner == pid => rt,
-        _ => {
-            let rt: &'static Runtime = Box::leak(Box::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build tokio runtime"),
-            ));
-            *current = Some((pid, rt));
-            rt
+    let mut current = RT.load(Ordering::Acquire);
+    loop {
+        // SAFETY: published pointers are never freed (see above).
+        if let Some(installed) = unsafe { current.as_ref() } {
+            if installed.pid == pid {
+                return &installed.runtime;
+            }
+        }
+        let built = Box::into_raw(Box::new(ProcessRuntime {
+            pid,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime"),
+        }));
+        match RT.compare_exchange(current, built, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return unsafe { &(*built).runtime },
+            Err(winner) => {
+                // Another thread of this process installed one first; ours never ran a task.
+                drop(unsafe { Box::from_raw(built) });
+                current = winner;
+            }
         }
     }
 }
