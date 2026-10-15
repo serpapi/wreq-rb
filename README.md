@@ -231,6 +231,12 @@ The `Wreq::Response` object provides:
 | `client_error?` | Boolean | Status 4xx? |
 | `server_error?` | Boolean | Status 5xx? |
 
+## Forking (Puma `preload_app!`, `fork_worker`, Unicorn)
+
+The gem is safe to load before `fork`. Each process gets its own Tokio runtime, built on the first request in that process, so a forked worker can make requests even after the parent already has.
+
+A `Wreq::Client` keeps a connection pool that belongs to the process that used it first. Using that client in a forked child raises `Wreq::Error`; create clients in the worker (for example in `on_worker_boot`) or lazily per process. A client created in the parent but never used works in any one child.
+
 ## Building from Source
 
 ```bash
