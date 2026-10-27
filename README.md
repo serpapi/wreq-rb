@@ -107,9 +107,10 @@ resp = client.post("https://api.example.com/data", json: { key: "value" })
 ## Overriding DNS
 
 Pass `resolve` to point specific domains at IP addresses of your choice,
-bypassing DNS for them (the equivalent of curl's `--resolve`). Useful for
-hitting a staging host by IP while keeping the real `Host` header and TLS SNI,
-or for pinning a domain to one node of a load balancer.
+bypassing DNS for them (similar to curl's `--resolve`, except that an entry
+covers every port of the domain). Useful for hitting a staging host by IP while
+keeping the real `Host` header and TLS SNI, or for pinning a domain to one node
+of a load balancer.
 
 ```ruby
 client = Wreq::Client.new(
@@ -121,6 +122,10 @@ client = Wreq::Client.new(
 
 resp = client.get("https://example.com/")  # connects to 127.0.0.1:443
 ```
+
+Keys are bare domain names, without a scheme, port or path. They match the
+URL's host regardless of case or a trailing dot, so `https://EXAMPLE.com./`
+also connects to `127.0.0.1`.
 
 Addresses are IPv4 or IPv6, with an optional port:
 
@@ -136,7 +141,24 @@ valid IPv6 address, so it is parsed as one (with no port) rather than as `::1`
 on port 8080.
 
 An explicit port in the request URL always wins over a port in the override.
-Domains without an entry resolve normally.
+Domains without an entry resolve normally, including the target of a redirect
+(when `redirect` is enabled).
+
+### Proxies
+
+`resolve` only takes effect when the client looks the domain up itself. An HTTP
+or HTTPS proxy, or a `socks4a://` or `socks5h://` proxy, receives the domain
+name and does its own lookup, so the entry is ignored. This applies to proxies
+from the `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` environment variables too,
+which the client uses unless you pass `no_proxy: true`. `socks4://` and
+`socks5://` proxies get the entry's first address, on the URL's port or the
+scheme default.
+
+> **Pinning domains after a security check:** if you resolve and vet a domain
+> yourself (for example to block SSRF or DNS rebinding) and then pin it with
+> `resolve`, also pass `no_proxy: true` and leave redirects off (the default).
+> Otherwise a proxy can do its own lookup, or a redirect can take the request
+> to a domain you never checked.
 
 ## HTTP Methods
 
