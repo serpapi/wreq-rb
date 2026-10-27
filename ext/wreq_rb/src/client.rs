@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use wreq::dns::{Addrs, GaiResolver, Name, Resolve, Resolving};
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::tls::TlsVersion;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
@@ -391,6 +393,14 @@ impl Client {
                 let addr: IpAddr = addr_str.parse()
                     .map_err(|_| generic_error(format!("invalid IP address: '{}'", addr_str)))?;
                 builder = builder.local_address(addr);
+            }
+
+            if let Some(resolve_hash) = hash_get_hash(&opts, "resolve")? {
+                let overrides = hash_to_dns_overrides(&resolve_hash)?;
+                builder = builder.dns_resolver(OverrideResolver {
+                    overrides,
+                    fallback: GaiResolver::new(),
+                });
             }
 
             if let Some(v) = hash_get_bool(&opts, "tls_sni")? {
@@ -802,16 +812,20 @@ fn hash_get_array(hash: &RHash, key: &str) -> Result<Option<RArray>, magnus::Err
     }
 }
 
+/// Convert a String or Symbol (a hash key or header name) into a String.
+fn key_to_string(val: Value) -> Result<String, magnus::Error> {
+    let ruby = unsafe { Ruby::get_unchecked() };
+    if val.is_kind_of(ruby.class_symbol()) {
+        val.funcall("to_s", ())
+    } else {
+        TryConvert::try_convert(val)
+    }
+}
+
 fn array_to_orig_header_map(ary: RArray) -> Result<OrigHeaderMap, magnus::Error> {
     let mut orig = OrigHeaderMap::with_capacity(ary.len());
     for elem in ary.into_iter() {
-        let ruby = unsafe { Ruby::get_unchecked() };
-        let name_str: String = if elem.is_kind_of(ruby.class_symbol()) {
-            elem.funcall("to_s", ())?  
-        } else {
-            TryConvert::try_convert(elem)?
-        };
-        orig.insert(name_str);
+        orig.insert(key_to_string(elem)?);
     }
     Ok(orig)
 }
@@ -822,12 +836,7 @@ fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
         if v.is_nil() {
             return Ok(magnus::r_hash::ForEach::Continue);
         }
-        let ruby = unsafe { Ruby::get_unchecked() };
-        let ks: String = if k.is_kind_of(ruby.class_symbol()) {
-            k.funcall("to_s", ())?
-        } else {
-            TryConvert::try_convert(k)?
-        };
+        let ks = key_to_string(k)?;
         let vs: String = v.funcall("to_s", ())?;
         let name =
             HeaderName::from_bytes(ks.as_bytes()).map_err(|e| generic_error(e))?;
@@ -838,15 +847,107 @@ fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
     Ok(hmap)
 }
 
+/// DNS resolver behind the `resolve:` option. wreq's own overrides
+/// (`resolve_to_addrs`) compare the URL host byte for byte, so "EXAMPLE.com"
+/// or "example.com." in a URL would miss an "example.com" entry and silently
+/// fall back to a real DNS lookup. Here both sides are normalized first.
+struct OverrideResolver {
+    overrides: HashMap<String, Vec<SocketAddr>>,
+    /// wreq's default resolver for the features this crate enables.
+    fallback: GaiResolver,
+}
+
+impl Resolve for OverrideResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        match self.overrides.get(&normalize_host(name.as_str())) {
+            Some(addrs) => {
+                let addrs: Addrs = Box::new(addrs.clone().into_iter());
+                Box::pin(std::future::ready(Ok(addrs)))
+            }
+            None => self.fallback.resolve(name),
+        }
+    }
+}
+
+/// Host names are case-insensitive, and a trailing dot ("example.com.") names
+/// the same host.
+fn normalize_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
+/// Validate and normalize a `resolve:` key. Keys that can never equal a URL
+/// host, such as curl-style "example.com:443" or an IP address (which is never
+/// looked up), are rejected instead of being silently ignored.
+fn parse_resolve_host(key: &str) -> Result<String, magnus::Error> {
+    let host = normalize_host(key);
+    let is_domain = !host.is_empty()
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        && host.parse::<IpAddr>().is_err();
+    if !is_domain {
+        return Err(generic_error(format!(
+            "invalid resolve host: '{}'. Use a bare domain name such as 'example.com' \
+             (ASCII, without a scheme, port or path)", key
+        )));
+    }
+    Ok(host)
+}
+
+/// Parse a DNS override target into a SocketAddr. Accepts a bare IP
+/// ("1.2.3.4", "::1", "[::1]") or an IP with a port ("1.2.3.4:8080",
+/// "[::1]:8080"). A missing port is stored as 0, which makes wreq fall back to
+/// the port in the request URL (or the scheme's default port).
+///
+/// An IPv6 address with a port must be bracketed: "::1:8080" is a valid IPv6
+/// address in its own right and parses as one, not as "::1" on port 8080.
+fn parse_resolve_address(host: &str, s: &str) -> Result<SocketAddr, magnus::Error> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let bare = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => Ok(SocketAddr::new(ip, 0)),
+        Err(_) => Err(generic_error(format!(
+            "invalid resolve address for '{}': '{}'. Use an IP ('1.2.3.4', '::1') \
+             or an IP with a port ('1.2.3.4:8080', '[::1]:8080')", host, s
+        ))),
+    }
+}
+
+/// Convert a `resolve:` hash of host => address(es) into DNS overrides keyed by
+/// normalized host. Each value is a single address string or an array of them.
+fn hash_to_dns_overrides(hash: &RHash) -> Result<HashMap<String, Vec<SocketAddr>>, magnus::Error> {
+    let mut overrides: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+    hash.foreach(|k: Value, v: Value| {
+        let key = key_to_string(k)?;
+        let host = parse_resolve_host(&key)?;
+        let addr_strs: Vec<String> = match RArray::from_value(v) {
+            Some(ary) => ary.to_vec()?,
+            None => vec![TryConvert::try_convert(v)?],
+        };
+        if addr_strs.is_empty() {
+            return Err(generic_error(format!(
+                "resolve entry for '{}' has no addresses", key
+            )));
+        }
+        let addrs = addr_strs
+            .iter()
+            .map(|s| parse_resolve_address(&key, s))
+            .collect::<Result<Vec<_>, _>>()?;
+        if overrides.insert(host, addrs).is_some() {
+            return Err(generic_error(format!(
+                "duplicate resolve host: '{}' (hosts match regardless of case \
+                 and a trailing dot)", key
+            )));
+        }
+        Ok(magnus::r_hash::ForEach::Continue)
+    })?;
+    Ok(overrides)
+}
+
 fn hash_to_pairs(hash: &RHash) -> Result<Vec<(String, String)>, magnus::Error> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     hash.foreach(|k: Value, v: Value| {
-        let ruby = unsafe { Ruby::get_unchecked() };
-        let ks: String = if k.is_kind_of(ruby.class_symbol()) {
-            k.funcall("to_s", ())?
-        } else {
-            TryConvert::try_convert(k)?
-        };
+        let ks = key_to_string(k)?;
         let vs: String = v.funcall("to_s", ())?;
         pairs.push((ks, vs));
         Ok(magnus::r_hash::ForEach::Continue)
