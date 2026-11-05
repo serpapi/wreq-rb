@@ -441,6 +441,42 @@ impl Client {
         self.execute_method("OPTIONS", args)
     }
 
+    /// client.preconnect(url) or client.preconnect(url, opts)
+    ///
+    /// Opens a connection (TCP + proxy tunnel + TLS handshake) to the URL's origin
+    /// and keeps it idle in the pool without sending a request.
+    fn preconnect(&self, args: &[Value]) -> Result<(), magnus::Error> {
+        let url: String = match args.first() {
+            Some(v) => TryConvert::try_convert(*v)?,
+            None => return Err(generic_error("url is required")),
+        };
+
+        let mut req = self.inner.get(&url);
+        if let Some(opts) = args.get(1) {
+            req = apply_request_options(req, &RHash::try_convert(*opts)?)?;
+        }
+
+        let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        let outcome: Option<Result<(), wreq::Error>> = unsafe {
+            without_gvl(|thread_token| {
+                runtime().block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = thread_token.cancelled() => None,
+                        _ = client_token.cancelled() => None,
+                        res = req.preconnect() => Some(res),
+                    }
+                })
+            })
+        }?;
+
+        match outcome {
+            Some(res) => res.map_err(to_magnus_error),
+            None => Err(generic_error("request interrupted")),
+        }
+    }
+
     fn cancel(&self) {
         // Replace the cancel token first so new requests use a fresh token,
         // then cancel the old one to unblock all current in-flight select!s.
@@ -870,6 +906,7 @@ pub fn init(_ruby: &magnus::Ruby, module: &magnus::RModule) -> Result<(), magnus
     client_class.define_method("head", method!(Client::head, -1))?;
     client_class.define_method("options", method!(Client::options, -1))?;
     client_class.define_method("request_batch", method!(Client::request_batch, -1))?;
+    client_class.define_method("preconnect", method!(Client::preconnect, -1))?;
     client_class.define_method("cancel", method!(Client::cancel, 0))?;
 
     module.define_module_function("get", function!(wreq_get, -1))?;

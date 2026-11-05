@@ -1,0 +1,266 @@
+diff --git a/src/client.rs b/src/client.rs
+index ccbdb0e9..d96bc245 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -48,7 +48,9 @@ use self::{
+         config::{ConfigService, ConfigServiceLayer},
+         redirect::{FollowRedirect, FollowRedirectLayer},
+         retry::RetryPolicy,
+-        timeout::{Timeout, TimeoutLayer, TimeoutOptions, body::TimeoutBody},
++        timeout::{
++            Timeout, TimeoutLayer, TimeoutOptions, body::TimeoutBody, fetch_timeout_options,
++        },
+         transfer_size::{CountingBody, TransferSizeLayer, TransferSizeService},
+     },
+     request::{Request, RequestBuilder},
+@@ -60,6 +62,7 @@ use crate::cookie;
+ use crate::dns::hickory::HickoryDnsResolver;
+ use crate::{
+     IntoUri, Method, Proxy,
++    config::RequestConfig,
+     conn::{
+         BoxedConnectorLayer, BoxedTransportConnector, Conn, Unnameable,
+         connector::{Connector, ConnectorBuilder},
+@@ -68,6 +71,7 @@ use crate::{
+     },
+     dns::{DnsResolverWithOverrides, DynResolver, GaiResolver, IntoResolve, Resolve},
+     error::{self, Error},
++    ext::UriExt,
+     header::OrigHeaderMap,
+     http1::Http1Options,
+     http2::Http2Options,
+@@ -154,7 +158,23 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
+ ///
+ /// [`Rc`]: std::rc::Rc
+ #[derive(Clone)]
+-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
++pub struct Client(Arc<ClientRef>);
++
++struct ClientRef {
++    service: Either<ClientService, BoxedClientService>,
++    preconnector: Preconnector,
++}
++
++/// Direct handle to the connection pool used by [`Client::preconnect`].
++///
++/// Preconnecting bypasses the request middleware stack, so the checks that
++/// stack would apply before a connection is opened are replicated here.
++struct Preconnector {
++    http: HttpClient<Connector, Body>,
++    https_only: bool,
++    timer: Timer,
++    timeout: RequestConfig<TimeoutOptions>,
++}
+ 
+ /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
+ #[must_use]
+@@ -430,7 +450,67 @@ impl Client {
+         let req = http::Request::<Body>::from(request);
+         Pending::Request {
+             uri: Some(req.uri().clone()),
+-            fut: Box::pin(Oneshot::new((*self.0).clone(), req)),
++            fut: Box::pin(Oneshot::new(self.0.service.clone(), req)),
++        }
++    }
++
++    /// Establishes a connection to the given URI ahead of time, without sending a request.
++    ///
++    /// The TCP connection (plus proxy tunnel and TLS handshake, where applicable) is
++    /// completed and the connection is kept idle in the pool, so that a subsequent
++    /// request to the same origin can reuse it and skip connection setup.
++    ///
++    /// If an idle connection to the origin already exists, it is reused and no new
++    /// connection is opened. The connection is subject to the pool's idle timeout and
++    /// has no effect if pooling is disabled.
++    ///
++    /// Use [`RequestBuilder::preconnect`] to preconnect with per-request options such as
++    /// a proxy or emulation, which must match the options of the later request for the
++    /// connection to be reused.
++    ///
++    /// # Errors
++    ///
++    /// This method fails if the URI is invalid or the connection cannot be established.
++    #[inline]
++    pub fn preconnect<U: IntoUri>(&self, uri: U) -> impl Future<Output = crate::Result<()>> {
++        self.get(uri).preconnect()
++    }
++
++    pub(crate) fn execute_preconnect(
++        &self,
++        request: Request,
++    ) -> impl Future<Output = crate::Result<()>> + Send + 'static + use<> {
++        let req = http::Request::<Body>::from(request);
++        let client = self.0.clone();
++        async move {
++            let preconnector = &client.preconnector;
++            let uri = req.uri().clone();
++
++            if !(uri.is_http() || uri.is_https()) || (preconnector.https_only && !uri.is_https()) {
++                return Err(Error::uri_bad_scheme(uri));
++            }
++
++            let (total_timeout, _) = fetch_timeout_options(&preconnector.timeout, req.extensions());
++            let connect = preconnector.http.preconnect(req);
++            let res = match total_timeout {
++                Some(timeout) => {
++                    let sleep = wreq_proto::rt::Timer::sleep(&preconnector.timer, timeout);
++                    match futures_util::future::select(connect, sleep).await {
++                        futures_util::future::Either::Left((res, _)) => res,
++                        futures_util::future::Either::Right(_) => {
++                            Err(Error::request(error::TimedOut).into())
++                        }
++                    }
++                }
++                None => connect.await,
++            };
++
++            res.map_err(|err| {
++                let err = err
++                    .downcast::<Error>()
++                    .map_or_else(Error::request, |err| *err);
++                if err.uri().is_none() { err.with_uri(uri) } else { err }
++            })
+         }
+     }
+ }
+@@ -588,6 +668,13 @@ impl ClientBuilder {
+                 .build(connector)
+         };
+ 
++        let preconnector = Preconnector {
++            http: service.clone(),
++            https_only: config.https_only,
++            timer: config.timer.clone(),
++            timeout: RequestConfig::new(Some(config.timeout_options)),
++        };
++
+         // Configured client service with layers
+         let client = {
+             let service = ServiceBuilder::new()
+@@ -645,7 +732,10 @@ impl ClientBuilder {
+             }
+         };
+ 
+-        Ok(Client(Arc::new(client)))
++        Ok(Client(Arc::new(ClientRef {
++            service: client,
++            preconnector,
++        })))
+     }
+ 
+     // Runtime options
+diff --git a/src/client/layer/client.rs b/src/client/layer/client.rs
+index 8b000486..8e5177a2 100644
+--- a/src/client/layer/client.rs
++++ b/src/client/layer/client.rs
+@@ -145,32 +145,50 @@ where
+     B::Data: Send,
+     B::Error: Into<BoxError>,
+ {
+-    fn request(
+-        &self,
+-        mut req: Request<B>,
+-    ) -> BoxFuture<'static, Result<Response<Incoming>, BoxError>> {
++    fn request(&self, mut req: Request<B>) -> BoxFuture<'static, Result<Response<Incoming>, BoxError>> {
++        match self.prepare(&mut req) {
++            Ok((this, descriptor)) => {
++                Box::pin(this.send_request(req, descriptor).map_err(Into::into))
++            }
++            Err(err) => Box::pin(future::err(err.into())),
++        }
++    }
++
++    /// Establishes (or reuses) a pooled connection for the request's destination
++    /// without sending the request, leaving the connection idle in the pool.
++    ///
++    /// The request is only used to derive the connection descriptor, so per-request
++    /// options (proxy, TLS/emulation, HTTP version, ...) produce the same pool key a
++    /// subsequent real request would use.
++    pub(crate) fn preconnect(&self, mut req: Request<B>) -> BoxFuture<'static, Result<(), BoxError>> {
++        match self.prepare(&mut req) {
++            Ok((this, descriptor)) => Box::pin(async move {
++                // Dropping the pooled connection returns it to the pool as idle.
++                this.connection_for(descriptor).await.map(drop).map_err(Into::into)
++            }),
++            Err(err) => Box::pin(future::err(err.into())),
++        }
++    }
++
++    #[allow(clippy::result_large_err)]
++    fn prepare(&self, req: &mut Request<B>) -> Result<(Self, ConnectionDescriptor), Error> {
+         let is_http_connect = req.method() == Method::CONNECT;
+         // Validate HTTP version early
+         match req.version() {
+             Version::HTTP_10 if is_http_connect => {
+                 warn!("CONNECT is not allowed for HTTP/1.0");
+-                return Box::pin(future::err(e!(UserUnsupportedRequestMethod).into()));
++                return Err(e!(UserUnsupportedRequestMethod));
+             }
+             Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 => {}
+             // completely unsupported HTTP version (like HTTP/0.9)!
+             _unsupported => {
+                 warn!("Request has unsupported version: {:?}", _unsupported);
+-                return Box::pin(future::err(e!(UserUnsupportedVersion).into()));
++                return Err(e!(UserUnsupportedVersion));
+             }
+         };
+ 
+         // Extract and normalize URI
+-        let uri = match normalize_uri(&mut req, is_http_connect) {
+-            Ok(uri) => uri,
+-            Err(err) => {
+-                return Box::pin(future::err(e!(UserAbsoluteUriRequired, err).into()));
+-            }
+-        };
++        let uri = normalize_uri(req, is_http_connect).map_err(|err| e!(UserAbsoluteUriRequired, err))?;
+ 
+         let mut this = self.clone();
+ 
+@@ -196,7 +214,7 @@ where
+             ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+         };
+ 
+-        Box::pin(this.send_request(req, descriptor).map_err(Into::into))
++        Ok((this, descriptor))
+     }
+ 
+     async fn send_request(
+diff --git a/src/client/layer/timeout.rs b/src/client/layer/timeout.rs
+index b978d75b..0d3f340c 100644
+--- a/src/client/layer/timeout.rs
++++ b/src/client/layer/timeout.rs
+@@ -105,7 +105,7 @@ where
+     }
+ }
+ 
+-fn fetch_timeout_options(
++pub(crate) fn fetch_timeout_options(
+     opts: &RequestConfig<TimeoutOptions>,
+     extensions: &http::Extensions,
+ ) -> (Option<Duration>, Option<Duration>) {
+diff --git a/src/client/request.rs b/src/client/request.rs
+index 0d4421ca..aeeb0cfd 100644
+--- a/src/client/request.rs
++++ b/src/client/request.rs
+@@ -835,6 +835,21 @@ impl RequestBuilder {
+         }
+     }
+ 
++    /// Establishes a connection for this request ahead of time, without sending it.
++    ///
++    /// Only connection-level options (such as proxy, emulation/TLS options, HTTP
++    /// version and timeout) are taken into account; the method, headers and body are
++    /// ignored. See [`Client::preconnect`] for details.
++    ///
++    /// # Errors
++    ///
++    /// This method fails if the request is invalid or the connection cannot be
++    /// established.
++    pub fn preconnect(self) -> impl Future<Output = crate::Result<()>> + Send + 'static {
++        let fut = self.request.map(|req| self.client.execute_preconnect(req));
++        async move { fut?.await }
++    }
++
+     /// Attempt to clone the RequestBuilder.
+     ///
+     /// `None` is returned if the RequestBuilder can not be cloned,
