@@ -2,6 +2,7 @@
 
 mod client;
 mod error;
+mod firefox;
 mod response;
 
 use magnus::prelude::*;

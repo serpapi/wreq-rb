@@ -182,7 +182,7 @@ wreq-rb emulates real browser TLS fingerprints, HTTP/2 settings, and headers by 
 resp = Wreq.get("https://tls.peet.ws/api/all")
 
 # Explicit browser emulation
-client = Wreq::Client.new(emulation: "firefox_151")
+client = Wreq::Client.new(emulation: "firefox_158")
 client = Wreq::Client.new(emulation: "safari_18.5")
 client = Wreq::Client.new(emulation: "edge_148")
 
@@ -205,11 +205,17 @@ resp = client.get("https://example.com", emulation: "safari_26.2")
 | Browser | Example values |
 |---------|---------------|
 | Chrome | `chrome_100` .. `chrome_148` |
-| Firefox | `firefox_109` .. `firefox_151`, `firefox_private_135` |
+| Firefox | `firefox_109` .. `firefox_158`, `firefox_private_135` |
 | Safari | `safari_15.3` .. `safari_26.4`, `safari_ios_26`, `safari_ipad_18` |
 | Edge | `edge_101` .. `edge_148` |
 | Opera | `opera_116` .. `opera_131` |
 | OkHttp | `okhttp_3.9` .. `okhttp_5` |
+
+A client created with `firefox_152` or newer also reproduces Firefox's HTTP/1.1 request: `Host` first, header names spelled and ordered the way Firefox sends them, and `Connection: keep-alive`. Headers you add yourself (`Cookie`, `Referer`, `Content-Type`, ...) go where Firefox puts them on a navigation, over HTTP/2 as well; headers Firefox has no fixed place for follow `Accept-Encoding` in the order and spelling you gave them.
+
+- `TE: trailers`, which Firefox sends over HTTP/2 only, is also sent over HTTP/1.1 unless the client is created with `http1_only: true`. That option makes the TLS handshake offer only `http/1.1`, which Firefox never does.
+- A client's `header_order` takes precedence over the profile's order. As with every profile, a per-request `emulation:` brings its own headers on top of the client's and ignores the client's `header_order`, so create the client with `emulation: false` when you switch profiles per request. `Wreq.get(url, emulation: ...)` runs on the default Chrome client and sends its `sec-ch-ua` headers too.
+- Mixing is lossy the other way round as well: a request that selects another browser's profile on a `firefox_152`+ client inherits `Connection: keep-alive`, and over HTTP/2 the order of the headers after it is not kept.
 
 ## Response
 
