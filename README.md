@@ -229,8 +229,8 @@ resp = client.get("https://example.com", emulation: "safari_26.2")
 
 # Send only the request's headers: skips the client's emulation headers,
 # user_agent and headers. A per-request emulation still adds its own.
-# The emulation's TLS and HTTP/2 settings stay; the headers go out in the
-# order of the hash, so pass them in the browser's order.
+# The emulation's TLS and HTTP/2 settings stay. The client's header_order
+# setting still takes precedence over the request hash's order.
 resp = client.get("https://example.com/script.js",
   default_headers: false,
   headers: { "User-Agent" => "...", "Accept" => "*/*", "Sec-Fetch-Dest" => "script" })
