@@ -642,6 +642,10 @@ fn apply_request_options(
         req = req.headers(hmap);
     }
 
+    if let Some(enabled) = hash_get_bool(opts, "default_headers")? {
+        req = req.default_headers(enabled);
+    }
+
     if let Some(body_str) = hash_get_string(opts, "body")? {
         req = req.body(body_str);
     }

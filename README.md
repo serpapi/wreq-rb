@@ -173,6 +173,7 @@ Pass an options hash as the second argument to any HTTP method:
 | `proxy` | String | Per-request proxy URL |
 | `emulation` | String/Boolean | Per-request emulation override |
 | `emulation_os` | String | OS emulation: `windows`, `macos`, `linux`, `android`, `ios` |
+| `default_headers` | Boolean | `false` skips the client's default headers for this request (default: `true`) |
 
 ## Browser Emulation
 
@@ -198,6 +199,14 @@ client = Wreq::Client.new(emulation: "chrome_148", user_agent: "MyBot/1.0")
 
 # Per-request emulation override
 resp = client.get("https://example.com", emulation: "safari_26.2")
+
+# Send only the request's headers: skips the client's emulation headers,
+# user_agent and headers. A per-request emulation still adds its own.
+# The emulation's TLS and HTTP/2 settings stay; the headers go out in the
+# order of the hash, so pass them in the browser's order.
+resp = client.get("https://example.com/script.js",
+  default_headers: false,
+  headers: { "User-Agent" => "...", "Accept" => "*/*", "Sec-Fetch-Dest" => "script" })
 ```
 
 ### Supported Browsers
