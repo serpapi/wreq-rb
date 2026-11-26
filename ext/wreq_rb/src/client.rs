@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
@@ -14,7 +15,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
-use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::header::{
+    HeaderCaseName, HeaderMap, HeaderName, HeaderValue, IntoHeaderCaseName, OrigHeaderMap, CONNECTION,
+};
 use wreq::tls::TlsVersion;
 use wreq::IntoEmulation;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
@@ -265,6 +268,8 @@ fn build_emulation_option(
     Ok(build_emulation(profile, platform, http1_only))
 }
 
+type SpelledHeader = (HeaderName, HeaderCaseName);
+
 /// The header order of a client or request whose profile spells and orders the
 /// request headers itself, which today means the local Firefox profiles.
 ///
@@ -272,92 +277,61 @@ fn build_emulation_option(
 /// after them, in an order that follows from how its header map removes
 /// entries rather than from the order the headers were given in. So the order
 /// handed to wreq names every header the gem knows the request carries.
-#[derive(Clone)]
 struct HeaderOrder {
-    /// Names fixed by the `header_order` option. They come first, spelled as
-    /// the user spelled them.
-    user: OrigHeaderMap,
-    /// The profile's names, without the ones in `user`.
-    profile: OrigHeaderMap,
-    /// The profile name that headers neither list names are written before:
-    /// the profile's own slot for them, or the next name after it that
-    /// `user` left in `profile`. `None` puts them last.
-    slot: Option<HeaderName>,
-    /// The names in the client's `headers` option, spelled as given. Those
-    /// that neither list names get a place.
-    extra: Vec<String>,
+    /// New request headers go between these two parts, after any client extras.
+    prefix: OrigHeaderMap,
+    suffix: Vec<HeaderCaseName>,
+    known: HashSet<HeaderName>,
 }
 
 impl HeaderOrder {
-    fn new(user: Option<&OrigHeaderMap>, profile: &OrigHeaderMap, extra: Vec<String>) -> Self {
-        let user = user.cloned().unwrap_or_default();
-        let mut rest = OrigHeaderMap::with_capacity(profile.len());
-        let mut slot = None;
+    fn new(user: Option<&OrigHeaderMap>, profile: &OrigHeaderMap, extra: &[SpelledHeader]) -> Self {
+        let mut prefix = user.cloned().unwrap_or_default();
+        let mut known: HashSet<_> = prefix.iter().map(|(name, _)| name.clone()).collect();
+        let mut suffix = Vec::new();
         let mut slot_reached = false;
         for (name, spelled) in profile.iter() {
             slot_reached |= *name == crate::firefox::UNLISTED_HEADERS_BEFORE;
-            if !user.iter().any(|(ordered, _)| ordered == name) {
-                rest.insert(spelled);
-                if slot_reached && slot.is_none() {
-                    slot = Some(name.clone());
+            if known.insert(name.clone()) {
+                if slot_reached {
+                    suffix.push(spelled.clone());
+                } else {
+                    prefix.insert(spelled);
                 }
             }
         }
-        HeaderOrder { user, profile: rest, slot, extra }
-    }
-
-    fn lists(&self, name: &HeaderName) -> bool {
-        self.user.iter().chain(self.profile.iter()).any(|(listed, _)| listed == name)
-    }
-
-    /// The headers among the client's and the request's own that the order
-    /// has no place for, in the order they were given.
-    fn unlisted<'a>(&'a self, request: &'a [String]) -> Vec<(HeaderName, &'a str)> {
-        let mut unlisted: Vec<(HeaderName, &str)> = Vec::new();
-        for spelled in self.extra.iter().chain(request) {
-            let Ok(name) = HeaderName::from_bytes(spelled.as_bytes()) else {
-                continue;
-            };
-            if !self.lists(&name) && !unlisted.iter().any(|(seen, _)| *seen == name) {
-                unlisted.push((name, spelled));
+        for (name, spelled) in extra {
+            if known.insert(name.clone()) {
+                prefix.insert(spelled);
             }
         }
-        unlisted
+        Self { prefix, suffix, known }
     }
 
-    /// Whether a request with these headers needs an order of its own, that
-    /// is whether it carries a header the client's order does not name.
-    fn misses(&self, request: &[String]) -> bool {
-        self.unlisted(request).len() > self.unlisted(&[]).len()
-    }
-
-    /// The order for a request that carries the `request` headers on top of
-    /// the client's.
-    fn with(&self, request: &[String]) -> OrigHeaderMap {
-        let unlisted = self.unlisted(request);
-        let mut order = OrigHeaderMap::with_capacity(
-            self.user.len() + self.profile.len() + unlisted.len(),
-        );
-        for (_, spelled) in self.user.iter() {
+    fn append_suffix(&self, mut order: OrigHeaderMap) -> OrigHeaderMap {
+        for spelled in &self.suffix {
             order.insert(spelled);
-        }
-
-        let mut placed = false;
-        for (name, spelled) in self.profile.iter() {
-            if !placed && self.slot.as_ref() == Some(name) {
-                for (_, spelled) in &unlisted {
-                    order.insert(spelled.to_string());
-                }
-                placed = true;
-            }
-            order.insert(spelled);
-        }
-        if !placed {
-            for (_, spelled) in &unlisted {
-                order.insert(spelled.to_string());
-            }
         }
         order
+    }
+
+    fn base(&self) -> OrigHeaderMap {
+        self.append_suffix(self.prefix.clone())
+    }
+
+    /// Reuse the installed order unless this request introduces a new name.
+    fn for_request(&self, request: &[SpelledHeader]) -> Option<OrigHeaderMap> {
+        let mut extra = request.iter().filter(|(name, _)| !self.known.contains(name)).peekable();
+        extra.peek()?;
+
+        let mut order = self.prefix.clone();
+        let mut seen = HashSet::new();
+        for (name, spelled) in extra {
+            if seen.insert(name) {
+                order.insert(spelled);
+            }
+        }
+        Some(self.append_suffix(order))
     }
 }
 
@@ -371,22 +345,24 @@ fn restricted_to_http1(http1_only: bool, http2_only: bool) -> bool {
 /// it learns about the request's headers on the way.
 struct RequestHeaders {
     http1_only: bool,
+    /// Set by explicit client or request headers, never by a profile.
+    explicit_connection: bool,
     /// The header order in force: the client's, or the one of a profile
     /// selected for this request.
     order: Option<Arc<HeaderOrder>>,
     /// Headers the client adds to every request, spelled as given.
-    client: Arc<Vec<String>>,
+    client: Arc<Vec<SpelledHeader>>,
     /// Headers set for this request, spelled as given.
-    request: Vec<String>,
+    request: Vec<SpelledHeader>,
 }
 
 impl RequestHeaders {
     /// Give the request an order of its own when it carries headers the
     /// order in force does not name.
     fn finish(self, req: wreq::RequestBuilder) -> wreq::RequestBuilder {
-        match &self.order {
-            Some(order) if order.misses(&self.request) => req.orig_headers(order.with(&self.request)),
-            _ => req,
+        match self.order.and_then(|order| order.for_request(&self.request)) {
+            Some(order) => req.orig_headers(order),
+            None => req,
         }
     }
 }
@@ -400,10 +376,11 @@ struct Client {
     inner: wreq::Client,
     /// The client never negotiates HTTP/2 (`http1_only: true`).
     http1_only: bool,
+    explicit_connection: bool,
     /// Set when the client's profile orders the request headers itself.
     header_order: Option<Arc<HeaderOrder>>,
     /// The names in the client's `headers` option, spelled as given.
-    header_names: Arc<Vec<String>>,
+    header_names: Arc<Vec<SpelledHeader>>,
     cancel_token: std::sync::Mutex<CancellationToken>,
 }
 
@@ -420,6 +397,7 @@ impl Client {
             .retry(wreq::retry::Policy::never());
 
         let mut http1_only = false;
+        let mut explicit_connection = false;
         let mut header_order = None;
         let mut header_names = Vec::new();
 
@@ -428,13 +406,14 @@ impl Client {
             let force_http2 = hash_get_bool(&opts, "http2_only")? == Some(true);
             http1_only = restricted_to_http1(force_http1, force_http2);
 
-            let client_headers = match hash_get_hash(&opts, "headers")? {
-                Some(hdr_hash) => Some(hash_to_named_header_map(&hdr_hash)?),
-                None => None,
+            let client_headers = if let Some(hdr_hash) = hash_get_hash(&opts, "headers")? {
+                let (hmap, names) = hash_to_named_header_map(&hdr_hash)?;
+                explicit_connection = hmap.contains_key(CONNECTION);
+                header_names = names;
+                Some(hmap)
+            } else {
+                None
             };
-            if let Some((_, names)) = &client_headers {
-                header_names = names.clone();
-            }
 
             // Apply header_order BEFORE emulation so the user's ordering takes precedence
             let user_order = match hash_get_array(&opts, "header_order")? {
@@ -468,9 +447,9 @@ impl Client {
                     let order = HeaderOrder::new(
                         user_order.as_ref(),
                         &emulation.orig_headers,
-                        header_names.clone(),
+                        &header_names,
                     );
-                    emulation.orig_headers = order.with(&[]);
+                    emulation.orig_headers = order.base();
                     header_order = Some(Arc::new(order));
                 }
                 builder = builder.emulation(emulation);
@@ -480,7 +459,7 @@ impl Client {
                 builder = builder.user_agent(ua);
             }
 
-            if let Some((hmap, _)) = client_headers {
+            if let Some(hmap) = client_headers {
                 builder = builder.default_headers(hmap);
             }
 
@@ -605,6 +584,7 @@ impl Client {
         Ok(Client {
             inner: client,
             http1_only,
+            explicit_connection,
             header_order,
             header_names: Arc::new(header_names),
             cancel_token: std::sync::Mutex::new(CancellationToken::new()),
@@ -814,6 +794,7 @@ impl Client {
     fn request_headers(&self) -> RequestHeaders {
         RequestHeaders {
             http1_only: self.http1_only,
+            explicit_connection: self.explicit_connection,
             order: self.header_order.clone(),
             client: self.header_names.clone(),
             request: Vec::new(),
@@ -850,9 +831,11 @@ fn apply_request_options(
             // order with its own, which is empty for the bundled profiles.
             headers.order = match profile {
                 EmulationProfile::Firefox(_) => {
-                    // The client's own headers still go out with the request.
-                    let order = HeaderOrder::new(None, &opt.orig_headers, headers.client.to_vec());
-                    opt.orig_headers = order.with(&[]);
+                    if headers.explicit_connection {
+                        opt.headers.remove(CONNECTION);
+                    }
+                    let order = HeaderOrder::new(None, &opt.orig_headers, &headers.client);
+                    opt.orig_headers = order.base();
                     Some(Arc::new(order))
                 }
                 EmulationProfile::Bundled(_) => None,
@@ -863,6 +846,7 @@ fn apply_request_options(
 
     if let Some(hdr_hash) = hash_get_hash(opts, "headers")? {
         let (hmap, names) = hash_to_named_header_map(&hdr_hash)?;
+        headers.explicit_connection |= hmap.contains_key(CONNECTION);
         headers.request.extend(names);
         req = req.headers(hmap);
     }
@@ -1043,7 +1027,7 @@ fn array_to_orig_header_map(ary: RArray) -> Result<OrigHeaderMap, magnus::Error>
 
 /// Convert a headers hash into a header map, along with the names as the
 /// caller spelled them, in the order given.
-fn hash_to_named_header_map(hash: &RHash) -> Result<(HeaderMap, Vec<String>), magnus::Error> {
+fn hash_to_named_header_map(hash: &RHash) -> Result<(HeaderMap, Vec<SpelledHeader>), magnus::Error> {
     let mut hmap = HeaderMap::new();
     let mut names = Vec::new();
     hash.foreach(|k: Value, v: Value| {
@@ -1060,8 +1044,8 @@ fn hash_to_named_header_map(hash: &RHash) -> Result<(HeaderMap, Vec<String>), ma
         let name =
             HeaderName::from_bytes(ks.as_bytes()).map_err(|e| generic_error(e))?;
         let value = HeaderValue::from_str(&vs).map_err(|e| generic_error(e))?;
-        hmap.insert(name, value);
-        names.push(ks);
+        hmap.insert(name.clone(), value);
+        names.push((name, ks.into_header_case_name()));
         Ok(magnus::r_hash::ForEach::Continue)
     })?;
     Ok((hmap, names))
@@ -1137,8 +1121,10 @@ mod tests {
             .collect()
     }
 
-    fn strings(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
+    fn header_names(names: &[&'static str]) -> Vec<SpelledHeader> {
+        names.iter().map(|&spelled| {
+            (HeaderName::from_bytes(spelled.as_bytes()).unwrap(), spelled.into_header_case_name())
+        }).collect()
     }
 
     fn position(order: &[String], name: &str) -> usize {
@@ -1150,15 +1136,16 @@ mod tests {
 
     #[test]
     fn header_order_without_extras_is_the_profile_order() {
-        let order = HeaderOrder::new(None, &firefox_order(), Vec::new());
-        assert_eq!(spelled(&order.with(&[])), spelled(&firefox_order()));
-        assert!(!order.misses(&[]));
+        let order = HeaderOrder::new(None, &firefox_order(), &[]);
+        assert_eq!(spelled(&order.base()), spelled(&firefox_order()));
+        assert!(order.for_request(&[]).is_none());
     }
 
     #[test]
     fn header_order_places_unknown_headers_before_content_type_in_the_order_given() {
-        let order = HeaderOrder::new(None, &firefox_order(), strings(&["X-Client", "cookie"]));
-        let names = spelled(&order.with(&strings(&["x-b", "X-A", "Referer", "x-client"])));
+        let order = HeaderOrder::new(None, &firefox_order(), &header_names(&["X-Client", "cookie"]));
+        let request = header_names(&["x-b", "X-A", "X-B", "Referer", "x-client"]);
+        let names = spelled(&order.for_request(&request).unwrap());
 
         let start = position(&names, "Range") + 1;
         assert_eq!(names[start..start + 4], ["X-Client", "x-b", "X-A", "Content-Type"]);
@@ -1168,17 +1155,16 @@ mod tests {
 
     #[test]
     fn header_order_needs_a_request_order_only_for_new_names() {
-        let order = HeaderOrder::new(None, &firefox_order(), strings(&["X-Client"]));
-        assert!(!order.misses(&strings(&["cookie", "REFERER", "x-client"])));
-        assert!(order.misses(&strings(&["cookie", "x-new"])));
-        assert!(!order.misses(&strings(&["not a header name"])));
+        let order = HeaderOrder::new(None, &firefox_order(), &header_names(&["X-Client"]));
+        assert!(order.for_request(&header_names(&["cookie", "REFERER", "x-client"])).is_none());
+        assert!(order.for_request(&header_names(&["cookie", "x-new"])).is_some());
     }
 
     #[test]
     fn header_order_puts_the_users_names_first_with_their_spelling() {
         let user = order_of(&["host", "ACCEPT"]);
-        let order = HeaderOrder::new(Some(&user), &firefox_order(), Vec::new());
-        let names = spelled(&order.with(&strings(&["X-A"])));
+        let order = HeaderOrder::new(Some(&user), &firefox_order(), &[]);
+        let names = spelled(&order.for_request(&header_names(&["X-A"])).unwrap());
 
         assert_eq!(names[..4], ["host", "ACCEPT", "User-Agent", "Accept-Language"]);
         assert_eq!(names.iter().filter(|name| name.eq_ignore_ascii_case("accept")).count(), 1);
@@ -1188,8 +1174,8 @@ mod tests {
     #[test]
     fn header_order_keeps_unknown_headers_ahead_of_the_rest_when_the_user_orders_content_type() {
         let user = order_of(&["Content-Type", "content-length"]);
-        let order = HeaderOrder::new(Some(&user), &firefox_order(), Vec::new());
-        let names = spelled(&order.with(&strings(&["X-A", "X-B"])));
+        let order = HeaderOrder::new(Some(&user), &firefox_order(), &[]);
+        let names = spelled(&order.for_request(&header_names(&["X-A", "X-B"])).unwrap());
 
         assert_eq!(names[..2], ["Content-Type", "content-length"]);
         let start = position(&names, "X-A");

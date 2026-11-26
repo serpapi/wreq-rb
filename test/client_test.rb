@@ -194,6 +194,24 @@ class ClientTest < Minitest::Test
     assert_equal ["Connection: close"], received.grep(/\Aconnection:/i)
   end
 
+  def test_per_request_firefox_preserves_explicit_client_connection
+    client = Wreq::Client.new(
+      emulation: false, http1_only: true, no_proxy: true, headers: { "cOnNeCtIoN" => "close" }
+    )
+    received = capture_wire_headers(lines: true) { |url| client.get(url, emulation: "firefox_158") }
+
+    assert_equal ["Connection: close"], received.grep(/\Aconnection:/i)
+  end
+
+  def test_per_item_firefox_preserves_explicit_batch_connection
+    client = Wreq::Client.new(emulation: false, http1_only: true, no_proxy: true)
+    received = capture_wire_headers(lines: true) do |url|
+      client.request_batch([{ url: url, emulation: "firefox_158" }], headers: { "CONNECTION" => "close" })
+    end
+
+    assert_equal ["Connection: close"], received.grep(/\Aconnection:/i)
+  end
+
   def test_firefox_places_client_headers_without_request_headers
     client = Wreq::Client.new(
       emulation: "firefox_158", http1_only: true, no_proxy: true, headers: OWN_HEADERS
