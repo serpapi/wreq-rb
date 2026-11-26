@@ -99,4 +99,20 @@ class RequestTest < Minitest::Test
     body = resp.json
     assert_equal custom_ua, body["headers"]["User-Agent"]
   end
+
+  def test_default_headers_false_sends_only_request_headers
+    client = Wreq::Client.new(emulation: "chrome_145", user_agent: "MyCustomAgent/1.0", headers: { "X-Client" => "1" })
+
+    defaults = client.get("https://httpbun.com/headers").json["headers"]
+    assert_equal "?1", defaults["Sec-Fetch-User"]
+    assert_equal "1", defaults["X-Client"]
+
+    headers = client.get("https://httpbun.com/headers",
+      default_headers: false,
+      headers: { "Sec-Fetch-Dest" => "script" }).json["headers"]
+    assert_equal "script", headers["Sec-Fetch-Dest"]
+    %w[Sec-Fetch-User Upgrade-Insecure-Requests Sec-Ch-Ua User-Agent X-Client].each do |name|
+      assert_nil headers[name], name
+    end
+  end
 end
