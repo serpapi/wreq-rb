@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
@@ -14,11 +15,15 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use std::net::IpAddr;
-use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::header::{
+    HeaderCaseName, HeaderMap, HeaderName, HeaderValue, IntoHeaderCaseName, OrigHeaderMap, CONNECTION,
+};
 use wreq::tls::TlsVersion;
+use wreq::IntoEmulation;
 use wreq_util::{Emulation as BrowserEmulation, Platform as EmulationPlatform, Profile as BrowserProfile};
 
 use crate::error::{generic_error, to_magnus_error, wreq_error};
+use crate::firefox::FirefoxProfile;
 use crate::response::Response;
 
 // --------------------------------------------------------------------------
@@ -204,13 +209,26 @@ async fn execute_batch(reqs: Vec<wreq::RequestBuilder>, concurrency: usize) -> V
 // --------------------------------------------------------------------------
 
 /// The default browser profile to apply when none is specified.
-const DEFAULT_EMULATION: BrowserProfile = BrowserProfile::Chrome149;
+const DEFAULT_EMULATION: EmulationProfile = EmulationProfile::Bundled(BrowserProfile::Chrome149);
 
-/// Parse a Ruby string like "chrome_143" into a BrowserProfile variant.
-fn parse_emulation(name: &str) -> Result<BrowserProfile, magnus::Error> {
+/// A browser profile selectable through the `emulation` option.
+#[derive(Clone, Copy)]
+enum EmulationProfile {
+    /// A profile that ships with wreq-util.
+    Bundled(BrowserProfile),
+    /// A Firefox release newer than wreq-util knows about.
+    Firefox(&'static FirefoxProfile),
+}
+
+/// Parse a Ruby string like "chrome_143" into an emulation profile.
+fn parse_emulation(name: &str) -> Result<EmulationProfile, magnus::Error> {
     let json_val = serde_json::Value::String(name.to_string());
-    serde_json::from_value::<BrowserProfile>(json_val)
-        .map_err(|_| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_148', 'firefox_151', 'safari_18.5', etc.", name)))
+    if let Ok(profile) = serde_json::from_value::<BrowserProfile>(json_val) {
+        return Ok(EmulationProfile::Bundled(profile));
+    }
+    FirefoxProfile::find(name)
+        .map(EmulationProfile::Firefox)
+        .ok_or_else(|| generic_error(format!("unknown emulation: '{}'. Use names like 'chrome_148', 'firefox_158', 'safari_18.5', etc.", name)))
 }
 
 /// Parse a Ruby string like "windows" into an EmulationPlatform variant.
@@ -220,19 +238,133 @@ fn parse_emulation_os(name: &str) -> Result<EmulationPlatform, magnus::Error> {
         .map_err(|_| generic_error("unknown emulation_os. Use: 'windows', 'macos', 'linux', 'android', 'ios'"))
 }
 
-/// Build a BrowserEmulation from a profile and an optional platform from the opts hash.
+/// Build the emulation for a profile on the given platform. `http1_only` says
+/// that the client never negotiates HTTP/2.
+fn build_emulation(
+    profile: EmulationProfile,
+    platform: EmulationPlatform,
+    http1_only: bool,
+) -> wreq::Emulation {
+    match profile {
+        EmulationProfile::Bundled(profile) => BrowserEmulation::builder()
+            .profile(profile)
+            .platform(platform)
+            .build()
+            .into_emulation(),
+        EmulationProfile::Firefox(profile) => profile.emulation(platform, http1_only),
+    }
+}
+
+/// Build the emulation for a profile and an optional platform from the opts hash.
 fn build_emulation_option(
-    profile: BrowserProfile,
+    profile: EmulationProfile,
     opts: &RHash,
-) -> Result<BrowserEmulation, magnus::Error> {
+    http1_only: bool,
+) -> Result<wreq::Emulation, magnus::Error> {
     let platform = match hash_get_string(opts, "emulation_os")? {
         Some(platform_name) => parse_emulation_os(&platform_name)?,
         None => EmulationPlatform::default(),
     };
-    Ok(BrowserEmulation::builder()
-        .profile(profile)
-        .platform(platform)
-        .build())
+    Ok(build_emulation(profile, platform, http1_only))
+}
+
+type SpelledHeader = (HeaderName, HeaderCaseName);
+
+/// The header order of a client or request whose profile spells and orders the
+/// request headers itself, which today means the local Firefox profiles.
+///
+/// wreq writes the headers such an order names first and whatever is left
+/// after them, in an order that follows from how its header map removes
+/// entries rather than from the order the headers were given in. So the order
+/// handed to wreq names every header the gem knows the request carries.
+struct HeaderOrder {
+    /// New request headers go between these two parts, after any client extras.
+    prefix: OrigHeaderMap,
+    suffix: Vec<HeaderCaseName>,
+    known: HashSet<HeaderName>,
+}
+
+impl HeaderOrder {
+    fn new(user: Option<&OrigHeaderMap>, profile: &OrigHeaderMap, extra: &[SpelledHeader]) -> Self {
+        let mut prefix = user.cloned().unwrap_or_default();
+        let mut known: HashSet<_> = prefix.iter().map(|(name, _)| name.clone()).collect();
+        let mut suffix = Vec::new();
+        let mut slot_reached = false;
+        for (name, spelled) in profile.iter() {
+            slot_reached |= *name == crate::firefox::UNLISTED_HEADERS_BEFORE;
+            if known.insert(name.clone()) {
+                if slot_reached {
+                    suffix.push(spelled.clone());
+                } else {
+                    prefix.insert(spelled);
+                }
+            }
+        }
+        for (name, spelled) in extra {
+            if known.insert(name.clone()) {
+                prefix.insert(spelled);
+            }
+        }
+        Self { prefix, suffix, known }
+    }
+
+    fn append_suffix(&self, mut order: OrigHeaderMap) -> OrigHeaderMap {
+        for spelled in &self.suffix {
+            order.insert(spelled);
+        }
+        order
+    }
+
+    fn base(&self) -> OrigHeaderMap {
+        self.append_suffix(self.prefix.clone())
+    }
+
+    /// Reuse the installed order unless this request introduces a new name.
+    fn for_request(&self, request: &[SpelledHeader]) -> Option<OrigHeaderMap> {
+        let mut extra = request.iter().filter(|(name, _)| !self.known.contains(name)).peekable();
+        extra.peek()?;
+
+        let mut order = self.prefix.clone();
+        let mut seen = HashSet::new();
+        for (name, spelled) in extra {
+            if seen.insert(name) {
+                order.insert(spelled);
+            }
+        }
+        Some(self.append_suffix(order))
+    }
+}
+
+/// Whether a client with these options only ever speaks HTTP/1.1. Both options
+/// together leave an HTTP/2 client: `http2_only` is applied last and wins.
+fn restricted_to_http1(http1_only: bool, http2_only: bool) -> bool {
+    http1_only && !http2_only
+}
+
+/// What applying a request's options needs to know about the client, and what
+/// it learns about the request's headers on the way.
+struct RequestHeaders {
+    http1_only: bool,
+    /// Set by explicit client or request headers, never by a profile.
+    explicit_connection: bool,
+    /// The header order in force: the client's, or the one of a profile
+    /// selected for this request.
+    order: Option<Arc<HeaderOrder>>,
+    /// Headers the client adds to every request, spelled as given.
+    client: Arc<Vec<SpelledHeader>>,
+    /// Headers set for this request, spelled as given.
+    request: Vec<SpelledHeader>,
+}
+
+impl RequestHeaders {
+    /// Give the request an order of its own when it carries headers the
+    /// order in force does not name.
+    fn finish(self, req: wreq::RequestBuilder) -> wreq::RequestBuilder {
+        match self.order.and_then(|order| order.for_request(&self.request)) {
+            Some(order) => req.orig_headers(order),
+            None => req,
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -242,6 +374,13 @@ fn build_emulation_option(
 #[magnus::wrap(class = "Wreq::Client", free_immediately)]
 struct Client {
     inner: wreq::Client,
+    /// The client never negotiates HTTP/2 (`http1_only: true`).
+    http1_only: bool,
+    explicit_connection: bool,
+    /// Set when the client's profile orders the request headers itself.
+    header_order: Option<Arc<HeaderOrder>>,
+    /// The names in the client's `headers` option, spelled as given.
+    header_names: Arc<Vec<SpelledHeader>>,
     cancel_token: std::sync::Mutex<CancellationToken>,
 }
 
@@ -257,37 +396,70 @@ impl Client {
         let mut builder = wreq::Client::builder()
             .retry(wreq::retry::Policy::never());
 
+        let mut http1_only = false;
+        let mut explicit_connection = false;
+        let mut header_order = None;
+        let mut header_names = Vec::new();
+
         if let Some(opts) = opts {
+            let force_http1 = hash_get_bool(&opts, "http1_only")? == Some(true);
+            let force_http2 = hash_get_bool(&opts, "http2_only")? == Some(true);
+            http1_only = restricted_to_http1(force_http1, force_http2);
+
+            let client_headers = if let Some(hdr_hash) = hash_get_hash(&opts, "headers")? {
+                let (hmap, names) = hash_to_named_header_map(&hdr_hash)?;
+                explicit_connection = hmap.contains_key(CONNECTION);
+                header_names = names;
+                Some(hmap)
+            } else {
+                None
+            };
+
             // Apply header_order BEFORE emulation so the user's ordering takes precedence
-            if let Some(ary) = hash_get_array(&opts, "header_order")? {
-                let orig = array_to_orig_header_map(ary)?;
-                builder = builder.orig_headers(orig);
+            let user_order = match hash_get_array(&opts, "header_order")? {
+                Some(ary) => Some(array_to_orig_header_map(ary)?),
+                None => None,
+            };
+            if let Some(orig) = &user_order {
+                builder = builder.orig_headers(orig.clone());
             }
 
-            if let Some(val) = hash_get_value(&opts, "emulation")? {
-                let ruby = unsafe { Ruby::get_unchecked() };
-                if val.is_kind_of(ruby.class_false_class()) {
-                    // emulation: false — skip emulation entirely
-                } else if val.is_kind_of(ruby.class_true_class()) {
-                    let opt = build_emulation_option(DEFAULT_EMULATION, &opts)?;
-                    builder = builder.emulation(opt);
-                } else {
-                    let name: String = TryConvert::try_convert(val)?;
-                    let emu = parse_emulation(&name)?;
-                    let opt = build_emulation_option(emu, &opts)?;
-                    builder = builder.emulation(opt);
+            let profile = match hash_get_value(&opts, "emulation")? {
+                Some(val) => {
+                    let ruby = unsafe { Ruby::get_unchecked() };
+                    if val.is_kind_of(ruby.class_false_class()) {
+                        // emulation: false — skip emulation entirely
+                        None
+                    } else if val.is_kind_of(ruby.class_true_class()) {
+                        Some(DEFAULT_EMULATION)
+                    } else {
+                        let name: String = TryConvert::try_convert(val)?;
+                        Some(parse_emulation(&name)?)
+                    }
                 }
-            } else {
-                let opt = build_emulation_option(DEFAULT_EMULATION, &opts)?;
-                builder = builder.emulation(opt);
+                None => Some(DEFAULT_EMULATION),
+            };
+            if let Some(profile) = profile {
+                let mut emulation = build_emulation_option(profile, &opts, http1_only)?;
+                if let EmulationProfile::Firefox(_) = profile {
+                    // The user's position and spelling of a header win over
+                    // the profile's, and the client's own headers get a place.
+                    let order = HeaderOrder::new(
+                        user_order.as_ref(),
+                        &emulation.orig_headers,
+                        &header_names,
+                    );
+                    emulation.orig_headers = order.base();
+                    header_order = Some(Arc::new(order));
+                }
+                builder = builder.emulation(emulation);
             }
 
             if let Some(ua) = hash_get_string(&opts, "user_agent")? {
                 builder = builder.user_agent(ua);
             }
 
-            if let Some(hdr_hash) = hash_get_hash(&opts, "headers")? {
-                let hmap = hash_to_header_map(&hdr_hash)?;
+            if let Some(hmap) = client_headers {
                 builder = builder.default_headers(hmap);
             }
 
@@ -347,10 +519,10 @@ impl Client {
                 builder = builder.tls_cert_verification(v);
             }
 
-            if let Some(true) = hash_get_bool(&opts, "http1_only")? {
+            if force_http1 {
                 builder = builder.http1_only();
             }
-            if let Some(true) = hash_get_bool(&opts, "http2_only")? {
+            if force_http2 {
                 builder = builder.http2_only();
             }
 
@@ -405,11 +577,18 @@ impl Client {
                 builder = builder.tls_max_version(parse_tls_version(&s)?);
             }
         } else {
-            builder = builder.emulation(DEFAULT_EMULATION);
+            builder = builder.emulation(build_emulation(DEFAULT_EMULATION, EmulationPlatform::default(), false));
         }
 
         let client = builder.build().map_err(to_magnus_error)?;
-        Ok(Client { inner: client, cancel_token: std::sync::Mutex::new(CancellationToken::new()) })
+        Ok(Client {
+            inner: client,
+            http1_only,
+            explicit_connection,
+            header_order,
+            header_names: Arc::new(header_names),
+            cancel_token: std::sync::Mutex::new(CancellationToken::new()),
+        })
     }
 
     /// client.get(url) or client.get(url, opts)
@@ -453,7 +632,9 @@ impl Client {
 
         let mut req = self.inner.get(&url);
         if let Some(opts) = args.get(1) {
-            req = apply_request_options(req, &RHash::try_convert(*opts)?)?;
+            let opts = RHash::try_convert(*opts)?;
+            // Preconnect uses the profile for pooling but never sends the request headers.
+            req = apply_request_options(req, &opts, &mut self.request_headers())?;
         }
 
         let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -508,9 +689,11 @@ impl Client {
 
         let mut req = self.inner.request(method, &url);
 
+        let mut headers = self.request_headers();
         if let Some(opts) = opts {
-            req = apply_request_options(req, &opts)?;
+            req = apply_request_options(req, &opts, &mut headers)?;
         }
+        req = headers.finish(req);
 
         let client_token = self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
@@ -636,13 +819,24 @@ impl Client {
         }
 
         let mut req = self.inner.request(method, &url);
+        let mut headers = self.request_headers();
         if let Some(shared) = shared {
-            req = apply_request_options(req, shared)?;
+            req = apply_request_options(req, shared, &mut headers)?;
         }
         if let Some(item_opts) = item_opts {
-            req = apply_request_options(req, &item_opts)?;
+            req = apply_request_options(req, &item_opts, &mut headers)?;
         }
-        Ok(req)
+        Ok(headers.finish(req))
+    }
+
+    fn request_headers(&self) -> RequestHeaders {
+        RequestHeaders {
+            http1_only: self.http1_only,
+            explicit_connection: self.explicit_connection,
+            order: self.header_order.clone(),
+            client: self.header_names.clone(),
+            request: Vec::new(),
+        }
     }
 }
 
@@ -657,24 +851,41 @@ fn value_to_method(val: Value) -> Result<wreq::Method, magnus::Error> {
 fn apply_request_options(
     mut req: wreq::RequestBuilder,
     opts: &RHash,
+    headers: &mut RequestHeaders,
 ) -> Result<wreq::RequestBuilder, magnus::Error> {
     if let Some(val) = hash_get_value(opts, "emulation")? {
         let ruby = unsafe { Ruby::get_unchecked() };
         if val.is_kind_of(ruby.class_false_class()) {
             // emulation: false — no per-request emulation override
-        } else if val.is_kind_of(ruby.class_true_class()) {
-            let opt = build_emulation_option(DEFAULT_EMULATION, opts)?;
-            req = req.emulation(opt);
         } else {
-            let name: String = TryConvert::try_convert(val)?;
-            let emu = parse_emulation(&name)?;
-            let opt = build_emulation_option(emu, opts)?;
+            let profile = if val.is_kind_of(ruby.class_true_class()) {
+                DEFAULT_EMULATION
+            } else {
+                let name: String = TryConvert::try_convert(val)?;
+                parse_emulation(&name)?
+            };
+            let mut opt = build_emulation_option(profile, opts, headers.http1_only)?;
+            // A profile selected for the request replaces the client's header
+            // order with its own, which is empty for the bundled profiles.
+            headers.order = match profile {
+                EmulationProfile::Firefox(_) => {
+                    if headers.explicit_connection {
+                        opt.headers.remove(CONNECTION);
+                    }
+                    let order = HeaderOrder::new(None, &opt.orig_headers, &headers.client);
+                    opt.orig_headers = order.base();
+                    Some(Arc::new(order))
+                }
+                EmulationProfile::Bundled(_) => None,
+            };
             req = req.emulation(opt);
         }
     }
 
     if let Some(hdr_hash) = hash_get_hash(opts, "headers")? {
-        let hmap = hash_to_header_map(&hdr_hash)?;
+        let (hmap, names) = hash_to_named_header_map(&hdr_hash)?;
+        headers.explicit_connection |= hmap.contains_key(CONNECTION);
+        headers.request.extend(names);
         req = req.headers(hmap);
     }
 
@@ -856,8 +1067,11 @@ fn array_to_orig_header_map(ary: RArray) -> Result<OrigHeaderMap, magnus::Error>
     Ok(orig)
 }
 
-fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
+/// Convert a headers hash into a header map, along with the names as the
+/// caller spelled them, in the order given.
+fn hash_to_named_header_map(hash: &RHash) -> Result<(HeaderMap, Vec<SpelledHeader>), magnus::Error> {
     let mut hmap = HeaderMap::new();
+    let mut names = Vec::new();
     hash.foreach(|k: Value, v: Value| {
         if v.is_nil() {
             return Ok(magnus::r_hash::ForEach::Continue);
@@ -872,10 +1086,11 @@ fn hash_to_header_map(hash: &RHash) -> Result<HeaderMap, magnus::Error> {
         let name =
             HeaderName::from_bytes(ks.as_bytes()).map_err(|e| generic_error(e))?;
         let value = HeaderValue::from_str(&vs).map_err(|e| generic_error(e))?;
-        hmap.insert(name, value);
+        hmap.insert(name.clone(), value);
+        names.push((name, ks.into_header_case_name()));
         Ok(magnus::r_hash::ForEach::Continue)
     })?;
-    Ok(hmap)
+    Ok((hmap, names))
 }
 
 fn hash_to_pairs(hash: &RHash) -> Result<Vec<(String, String)>, magnus::Error> {
@@ -926,6 +1141,98 @@ pub fn init(_ruby: &magnus::Ruby, module: &magnus::RModule) -> Result<(), magnus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn firefox_order() -> OrigHeaderMap {
+        FirefoxProfile::find("firefox_158")
+            .unwrap()
+            .emulation(EmulationPlatform::default(), false)
+            .orig_headers
+    }
+
+    fn order_of(names: &[&'static str]) -> OrigHeaderMap {
+        let mut order = OrigHeaderMap::new();
+        for name in names {
+            order.insert(*name);
+        }
+        order
+    }
+
+    fn spelled(order: &OrigHeaderMap) -> Vec<String> {
+        order
+            .iter()
+            .map(|(_, name)| String::from_utf8(name.as_ref().to_vec()).unwrap())
+            .collect()
+    }
+
+    fn header_names(names: &[&'static str]) -> Vec<SpelledHeader> {
+        names.iter().map(|&spelled| {
+            (HeaderName::from_bytes(spelled.as_bytes()).unwrap(), spelled.into_header_case_name())
+        }).collect()
+    }
+
+    fn position(order: &[String], name: &str) -> usize {
+        order
+            .iter()
+            .position(|listed| listed == name)
+            .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
+    }
+
+    #[test]
+    fn header_order_without_extras_is_the_profile_order() {
+        let order = HeaderOrder::new(None, &firefox_order(), &[]);
+        assert_eq!(spelled(&order.base()), spelled(&firefox_order()));
+        assert!(order.for_request(&[]).is_none());
+    }
+
+    #[test]
+    fn header_order_places_unknown_headers_before_content_type_in_the_order_given() {
+        let order = HeaderOrder::new(None, &firefox_order(), &header_names(&["X-Client", "cookie"]));
+        let request = header_names(&["x-b", "X-A", "X-B", "Referer", "x-client"]);
+        let names = spelled(&order.for_request(&request).unwrap());
+
+        let start = position(&names, "Range") + 1;
+        assert_eq!(names[start..start + 4], ["X-Client", "x-b", "X-A", "Content-Type"]);
+        assert_eq!(names.len(), spelled(&firefox_order()).len() + 3);
+        assert_eq!(names.last().unwrap(), "TE");
+    }
+
+    #[test]
+    fn header_order_needs_a_request_order_only_for_new_names() {
+        let order = HeaderOrder::new(None, &firefox_order(), &header_names(&["X-Client"]));
+        assert!(order.for_request(&header_names(&["cookie", "REFERER", "x-client"])).is_none());
+        assert!(order.for_request(&header_names(&["cookie", "x-new"])).is_some());
+    }
+
+    #[test]
+    fn header_order_puts_the_users_names_first_with_their_spelling() {
+        let user = order_of(&["host", "ACCEPT"]);
+        let order = HeaderOrder::new(Some(&user), &firefox_order(), &[]);
+        let names = spelled(&order.for_request(&header_names(&["X-A"])).unwrap());
+
+        assert_eq!(names[..4], ["host", "ACCEPT", "User-Agent", "Accept-Language"]);
+        assert_eq!(names.iter().filter(|name| name.eq_ignore_ascii_case("accept")).count(), 1);
+        assert!(position(&names, "X-A") + 1 == position(&names, "Content-Type"));
+    }
+
+    #[test]
+    fn header_order_keeps_unknown_headers_ahead_of_the_rest_when_the_user_orders_content_type() {
+        let user = order_of(&["Content-Type", "content-length"]);
+        let order = HeaderOrder::new(Some(&user), &firefox_order(), &[]);
+        let names = spelled(&order.for_request(&header_names(&["X-A", "X-B"])).unwrap());
+
+        assert_eq!(names[..2], ["Content-Type", "content-length"]);
+        let start = position(&names, "X-A");
+        assert_eq!(names[start - 1..start + 3], ["Range", "X-A", "X-B", "Origin"]);
+        assert_eq!(names.last().unwrap(), "TE");
+    }
+
+    #[test]
+    fn http2_only_wins_over_http1_only() {
+        assert!(restricted_to_http1(true, false));
+        assert!(!restricted_to_http1(true, true));
+        assert!(!restricted_to_http1(false, true));
+        assert!(!restricted_to_http1(false, false));
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static READY: AtomicBool = AtomicBool::new(false);

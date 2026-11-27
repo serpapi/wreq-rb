@@ -43,6 +43,17 @@ class PreconnectTest < Minitest::Test
     assert_equal 1, @requests.size
   end
 
+  def test_preconnect_with_matching_firefox_profile_is_reused
+    client = Wreq::Client.new(emulation: false, no_proxy: true)
+    client.preconnect(@url, emulation: "firefox_158")
+    wait_for { @connections.size == 1 }
+    assert_equal 0, @requests.size
+
+    assert_equal 200, client.get(@url, emulation: "firefox_158").status
+    assert_equal 1, @connections.size
+    assert_equal 1, @requests.size
+  end
+
   def test_repeated_preconnect_reuses_idle_connection
     client = Wreq::Client.new(emulation: false, no_proxy: true)
     3.times { client.preconnect(@url) }
