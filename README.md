@@ -91,6 +91,10 @@ client = Wreq::Client.new(
   tcp_nodelay: true,           # disable Nagle algorithm (default: true)
   tcp_keepalive: 15,           # SO_KEEPALIVE interval in seconds (default: 15)
   local_address: "1.2.3.4",    # bind outgoing connections to this source IP
+  resolve: {                   # override DNS resolution per domain
+    "example.com" => "1.2.3.4",
+    "api.example.com" => ["1.2.3.4:8443", "[::1]:8443"],
+  },
   tls_sni: true,               # send SNI in TLS handshake (default: true)
   min_tls_version: "tls1.2",   # minimum TLS version: tls1.0, tls1.1, tls1.2, tls1.3
   max_tls_version: "tls1.3",   # maximum TLS version
@@ -99,6 +103,62 @@ client = Wreq::Client.new(
 resp = client.get("https://api.example.com/data")
 resp = client.post("https://api.example.com/data", json: { key: "value" })
 ```
+
+## Overriding DNS
+
+Pass `resolve` to point specific domains at IP addresses of your choice,
+bypassing DNS for them (similar to curl's `--resolve`, except that an entry
+covers every port of the domain). Useful for hitting a staging host by IP while
+keeping the real `Host` header and TLS SNI, or for pinning a domain to one node
+of a load balancer.
+
+```ruby
+client = Wreq::Client.new(
+  resolve: {
+    "example.com" => "127.0.0.1",                       # one address
+    "api.example.com" => ["10.0.0.1", "10.0.0.2"],      # tried in order
+  }
+)
+
+resp = client.get("https://example.com/")  # connects to 127.0.0.1:443
+```
+
+Keys are bare domain names, without a scheme, port or path. They match the
+URL's host regardless of case or a trailing dot, so `https://EXAMPLE.com./`
+also connects to `127.0.0.1`.
+
+Addresses are IPv4 or IPv6, with an optional port:
+
+| Value | Connects to |
+|-------|-------------|
+| `"1.2.3.4"` | `1.2.3.4` on the URL's port, or the scheme default |
+| `"1.2.3.4:8443"` | `1.2.3.4:8443` |
+| `"::1"` / `"[::1]"` | `[::1]` on the URL's port, or the scheme default |
+| `"[::1]:8443"` | `[::1]:8443` |
+
+An IPv6 address with a port **must** be bracketed: `"::1:8080"` is itself a
+valid IPv6 address, so it is parsed as one (with no port) rather than as `::1`
+on port 8080.
+
+An explicit port in the request URL always wins over a port in the override.
+Domains without an entry resolve normally, including the target of a redirect
+(when `redirect` is enabled).
+
+### Proxies
+
+`resolve` only takes effect when the client looks the domain up itself. An HTTP
+or HTTPS proxy, or a `socks4a://` or `socks5h://` proxy, receives the domain
+name and does its own lookup, so the entry is ignored. This applies to proxies
+from the `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` environment variables too,
+which the client uses unless you pass `no_proxy: true`. `socks4://` and
+`socks5://` proxies get the entry's first address, on the URL's port or the
+scheme default.
+
+> **Pinning domains after a security check:** if you resolve and vet a domain
+> yourself (for example to block SSRF or DNS rebinding) and then pin it with
+> `resolve`, also pass `no_proxy: true` and leave redirects off (the default).
+> Otherwise a proxy can do its own lookup, or a redirect can take the request
+> to a domain you never checked.
 
 ## HTTP Methods
 
