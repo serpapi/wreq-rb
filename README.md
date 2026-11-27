@@ -142,6 +142,33 @@ client.request_batch([
 - `cancel` and Ruby thread interrupts abort the whole batch, raising
   `Wreq::Error` with `"request interrupted"`.
 
+### Preconnecting
+
+`Wreq::Client#preconnect` opens a connection to a URL's origin ahead of time —
+DNS, TCP, proxy tunnel and TLS handshake — without sending a request. The
+connection is kept idle in the client's pool, so the next request to the same
+origin skips connection setup.
+
+```ruby
+client = Wreq::Client.new
+
+client.preconnect("https://api.example.com")   # returns nil, raises Wreq::Error on failure
+# ... later ...
+client.get("https://api.example.com/data")     # reuses the warm connection
+```
+
+- Connection-level options must match the later request for the connection to
+  be reused. Pass `proxy:` and `emulation:` (plus `emulation_os:` etc.) the same
+  way you would to the request. `timeout:` bounds the preconnect. Other request
+  options are ignored.
+- If an idle connection to the origin already exists, it's reused and no new
+  connection is opened. Preconnect several origins concurrently from separate
+  threads, because the GVL is released.
+- The connection is subject to the pool's idle timeout (90 seconds) and may
+  also be closed by the server. If it's closed, the request falls back to a
+  fresh connection. Preconnecting has no effect with `pool_max_idle_per_host: 0`.
+- `cancel` and Ruby thread interrupts abort a pending preconnect.
+
 ### Cancelling Requests
 
 Call `cancel` on a client to interrupt all in-flight requests immediately:
@@ -173,6 +200,7 @@ Pass an options hash as the second argument to any HTTP method:
 | `proxy` | String | Per-request proxy URL |
 | `emulation` | String/Boolean | Per-request emulation override |
 | `emulation_os` | String | OS emulation: `windows`, `macos`, `linux`, `android`, `ios` |
+| `default_headers` | Boolean | `false` skips the client's default headers for this request (default: `true`) |
 
 ## Browser Emulation
 
@@ -198,6 +226,14 @@ client = Wreq::Client.new(emulation: "chrome_148", user_agent: "MyBot/1.0")
 
 # Per-request emulation override
 resp = client.get("https://example.com", emulation: "safari_26.2")
+
+# Send only the request's headers: skips the client's emulation headers,
+# user_agent and headers. A per-request emulation still adds its own.
+# The emulation's TLS and HTTP/2 settings stay. The client's header_order
+# setting still takes precedence over the request hash's order.
+resp = client.get("https://example.com/script.js",
+  default_headers: false,
+  headers: { "User-Agent" => "...", "Accept" => "*/*", "Sec-Fetch-Dest" => "script" })
 ```
 
 ### Supported Browsers
