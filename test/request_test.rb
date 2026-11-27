@@ -44,6 +44,11 @@ class RequestTest < Minitest::Test
     assert_equal "qux", body["args"]["baz"]
   end
 
+  def test_query_params_append_to_existing_query
+    resp = Wreq.get("https://httpbun.com/get?foo=bar", query: { "baz" => "qux" })
+    assert_equal({ "foo" => "bar", "baz" => "qux" }, resp.json["args"])
+  end
+
   def test_head_request
     resp = Wreq.head("https://httpbun.com/any")
     assert_equal 200, resp.status
