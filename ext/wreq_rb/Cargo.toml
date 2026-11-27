@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
-wreq = { path = "../../vendor/wreq", version = "=0.16.1", features = [
+wreq = { path = "../../vendor/wreq", version = "=0.16.5", features = [
   "cookies",
   "json",
   "gzip",
@@ -24,7 +24,7 @@ wreq = { path = "../../vendor/wreq", version = "=0.16.1", features = [
   "query",
   "form",
 ] }
-wreq-util = { version = "=0.2.0", features = ["emulation", "emulation-serde", "emulation-compression"] }
+wreq-util = { version = "=0.2.1", features = ["emulation", "emulation-serde", "emulation-compression"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde_json = "1.0"
@@ -35,6 +35,6 @@ http = "1"
 magnus = { version = "0.8", features = ["embed"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-wreq = { path = "../../vendor/wreq", version = "=0.16.1", features = [
+wreq = { path = "../../vendor/wreq", version = "=0.16.5", features = [
   "prefix-symbols",
 ] }
