@@ -109,6 +109,26 @@ class ClientTest < Minitest::Test
     assert_operator elapsed, :>=, 0.4
   end
 
+  def test_header_order_takes_precedence_over_request_emulation
+    order = ["host", "accept", "user-agent"]
+    client = Wreq::Client.new(
+      emulation: false,
+      http1_only: true,
+      no_proxy: true,
+      header_order: order
+    )
+    received = capture_wire_headers do |url|
+      client.get(url, emulation: "chrome_145")
+    end
+
+    positions = order.map { |header| received.index(header) }.compact
+    assert_equal order.size, positions.size,
+      "Not all target headers found in: #{received.inspect}"
+    assert_equal positions.sort, positions,
+      "Expected client's header_order #{order.inspect} to take precedence " \
+      "over request emulation; got positions #{positions.inspect} in: #{received.inspect}"
+  end
+
   private
 
   def stalled_tls_request_duration(options, request_timeout: 3)
